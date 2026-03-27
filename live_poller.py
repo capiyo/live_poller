@@ -1,15 +1,13 @@
 """
-FanClash Live Score Poller — Render Edition (Smart Sleep Version)
+FanClash Live Score Poller — Render Edition (Infinite Sleep Loop)
 ==================================================================
-- Preserves ALL core functionality (goal detection, notifications, cron)
-- Falls back to smart sleep when cron unavailable (Render)
-- Zero CPU usage between checks
-- Same MongoDB structure, same API calls, same push notifications
+- Never exits — runs forever on Render
+- Uses smart sleep between checks
+- Preserves all core functionality
 """
 
 import time
 import logging
-import subprocess
 import sys
 import os
 from datetime import datetime, timedelta, timezone
@@ -28,16 +26,10 @@ FANCLASH_API    = os.environ.get("FANCLASH_API",    "https://fanclash-api.onrend
 SOFASCORE_API   = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME  = "https://www.sofascore.com"
 
-POLLER_SCRIPT_PATH = "/poller/live_poller.py"
-PYTHON_PATH        = sys.executable
-
 NAIROBI_OFFSET    = timedelta(hours=3)
 POLL_INTERVAL_SEC = 60
 PRE_KICKOFF_MINS  = 30
 LIVE_WINDOW_MINS  = 120
-
-# Detect if we're on Render (no cron access)
-CAN_USE_CRON = os.path.exists("/usr/bin/crontab") and not os.environ.get("RENDER")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -107,84 +99,40 @@ def get_next_kickoff(fixtures: list) -> Optional[datetime]:
     future = [f["_kickoff_utc"] for f in fixtures if f["_kickoff_utc"] > now]
     return min(future) if future else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CRON SELF-SCHEDULER (only if available)
-# ─────────────────────────────────────────────────────────────────────────────
 
-CRON_MARKER = "# fanclash-live-poller"
-
-def _read_crontab() -> list:
-    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-    return result.stdout.splitlines()
-
-def _write_crontab(lines: list):
-    new_crontab = "\n".join(lines) + "\n"
-    subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
-
-def reschedule_cron(run_at: datetime):
-    if not CAN_USE_CRON:
-        logger.info(f"📅 Would schedule for {run_at.strftime('%Y-%m-%d %H:%M')} UTC (cron unavailable, using sleep)")
-        return
-    lines = [l for l in _read_crontab() if CRON_MARKER not in l]
-    cron_line = (
-        f"{run_at.minute} {run_at.hour} "
-        f"{run_at.day} {run_at.month} * "
-        f"{PYTHON_PATH} {POLLER_SCRIPT_PATH} "
-        f"{CRON_MARKER}"
-    )
-    lines.append(cron_line)
-    _write_crontab(lines)
-    eat = run_at + NAIROBI_OFFSET
-    logger.info(f"📅 Cron rescheduled → {eat.strftime('%Y-%m-%d %H:%M')} EAT")
-
-def remove_from_cron():
-    if not CAN_USE_CRON:
-        logger.info("🗑️ Cron removal skipped (cron unavailable)")
-        return
-    lines = [l for l in _read_crontab() if CRON_MARKER not in l]
-    _write_crontab(lines)
-    logger.info("🗑️ Removed from crontab")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SMART SLEEP (for Render)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def smart_sleep_until_next_game(fixtures: list):
-    """Sleep exactly until the next important event"""
+def smart_sleep_until_next_event(col):
+    """Sleep exactly until next game approaches, then return"""
+    all_fixtures = get_upcoming_fixtures(col)
     
-    if not fixtures:
-        logger.info("💤 No upcoming fixtures — sleeping 6 hours")
+    if not all_fixtures:
+        logger.info("📭 No upcoming fixtures — sleeping 6 hours")
         time.sleep(21600)  # 6 hours
         return
     
     now = datetime.now(timezone.utc)
-    next_ko = get_next_kickoff(fixtures)
+    next_ko = get_next_kickoff(all_fixtures)
     
     if not next_ko:
-        logger.info("💤 No future kick-offs — sleeping 6 hours")
+        logger.info("📭 No future kick-offs — sleeping 6 hours")
         time.sleep(21600)
         return
     
-    # Calculate when to wake up (30 mins before kick-off)
+    # Calculate wake time (30 mins before kick-off)
     wake_at = next_ko - timedelta(minutes=PRE_KICKOFF_MINS)
+    wake_eat = wake_at + NAIROBI_OFFSET
     
     if wake_at <= now:
         # Game is imminent or already started
-        logger.info(f"⚽ Game imminent — waking in 30 seconds")
-        time.sleep(30)
+        logger.info(f"⚽ Game imminent — checking now")
         return
     
     # Sleep until wake time
     sleep_seconds = (wake_at - now).total_seconds()
-    wake_eat = wake_at + NAIROBI_OFFSET
-    
     logger.info(f"💤 Sleeping until {wake_eat.strftime('%Y-%m-%d %H:%M')} EAT ({sleep_seconds/3600:.1f} hours)")
     time.sleep(sleep_seconds)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOFASCORE
+# SOFASCORE & GOAL DETECTION (all your existing functions here)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_session() -> cffi_requests.Session:
@@ -220,9 +168,6 @@ def fetch_live_score(session: cffi_requests.Session, sofascore_id: int) -> Optio
         logger.warning(f"⚠️ Error fetching event {sofascore_id}: {e}")
         return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SCORE DIFF
-# ─────────────────────────────────────────────────────────────────────────────
 
 def detect_scorer(old: dict, new_data: dict) -> Optional[str]:
     old_home = old.get("home_score") or 0
@@ -243,9 +188,6 @@ def get_match_status(status_type: str, status_code: int) -> str:
         return "completed"
     return "upcoming"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE UPDATES
-# ─────────────────────────────────────────────────────────────────────────────
 
 def update_fixture_score(col, fixture: dict, new_data: dict, scorer: Optional[str]):
     new_status = get_match_status(new_data["status_type"], new_data["status_code"])
@@ -289,9 +231,6 @@ def resolve_first_goal_prop(col, fixture: dict, scorer: str):
         )
         logger.info(f"🏆 First goal prop resolved → {scorer} ({match_id})")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PUSH NOTIFICATIONS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_voters(match_id: str) -> list:
     try:
@@ -371,9 +310,6 @@ def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
 
     logger.info(f"📲 Notified {notified} voters — {fixture_name}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE POLL LOOP (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list):
     watch = {f["match_id"]: f for f in live_fixtures}
@@ -402,10 +338,11 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
                 resolve_first_goal_prop(col, fixture, scorer)
                 notify_goal(fixture, scorer, h, a)
 
-                # Refresh local copy for next diff
+                # Refresh local copy
                 refreshed = col.find_one({"match_id": match_id})
-                refreshed["_kickoff_utc"] = fixture["_kickoff_utc"]
-                watch[match_id] = refreshed
+                if refreshed:
+                    refreshed["_kickoff_utc"] = fixture.get("_kickoff_utc")
+                    watch[match_id] = refreshed
             else:
                 update_fixture_score(col, fixture, live_data, scorer=None)
 
@@ -419,117 +356,50 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
 
     logger.info("🏁 All live games finished")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN (with smart sleep fallback)
+# MAIN INFINITE LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    test_mode = "--test" in sys.argv
-    continuous_mode = os.environ.get("CONTINUOUS_MODE") == "true" or not CAN_USE_CRON
-
+def main_loop():
+    """Infinite loop — never exits, sleeps smartly between checks"""
     logger.info("=" * 55)
-    logger.info(f"⚽ FanClash Live Poller {'[TEST MODE]' if test_mode else ''}")
-    logger.info(f"📡 Mode: {'Continuous (smart sleep)' if continuous_mode else 'Cron-scheduled'}")
+    logger.info("⚽ FanClash Live Poller — Infinite Sleep Mode")
+    logger.info("📡 Will run forever, sleeping when no games are active")
     logger.info("=" * 55)
-
+    
     mongo_client, col = connect_db()
-    now_utc = datetime.now(timezone.utc)
-
+    
     try:
-        all_fixtures = get_upcoming_fixtures(col)
-
-        if not all_fixtures:
-            logger.info("📭 No upcoming fixtures in DB")
-            if not test_mode and CAN_USE_CRON:
-                remove_from_cron()
-            return
-
-        # ── TEST MODE ─────────────────────────────────────────────────────
-        if test_mode:
-            logger.info(f"🧪 TEST MODE — {len(all_fixtures)} fixture(s) found:")
-            for f in all_fixtures:
-                ko = f["_kickoff_utc"] + NAIROBI_OFFSET
-                logger.info(
-                    f"   • {f['home_team']} vs {f['away_team']} | "
-                    f"{ko.strftime('%Y-%m-%d %H:%M')} EAT | "
-                    f"sofascore_id={f.get('sofascore_id')}"
-                )
-
-            target = all_fixtures[0]
-            ko = target["_kickoff_utc"] + NAIROBI_OFFSET
-            logger.info(f"\n🎯 Testing: {target['home_team']} vs {target['away_team']} ({ko.strftime('%Y-%m-%d %H:%M')} EAT)")
-
-            session = make_session()
-            sofascore_id = target.get("sofascore_id")
-            if sofascore_id:
-                logger.info(f"📡 Fetching from Sofascore (event {sofascore_id})...")
-                live_data = fetch_live_score(session, sofascore_id)
-                if live_data:
-                    logger.info(
-                        f"📊 Score: {target['home_team']} {live_data['home_score']} - "
-                        f"{live_data['away_score']} {target['away_team']} "
-                        f"| status={live_data['status_type']}"
-                    )
-                    scorer = detect_scorer(target, live_data)
-                    logger.info(f"🔍 Score change detected: {scorer or 'none'}")
+        while True:
+            try:
+                # Check for live games
+                all_fixtures = get_upcoming_fixtures(col)
+                live_now = get_live_fixtures(all_fixtures)
+                
+                if live_now:
+                    # Games are live — start polling
+                    logger.info(f"🔴 {len(live_now)} game(s) live — starting poller")
+                    session = make_session()
+                    poll_live_fixtures(col, session, live_now)
+                    # After games finish, continue loop to sleep again
                 else:
-                    logger.warning("⚠️ No live data — game not live yet on Sofascore")
-
-            if "--loop" in sys.argv:
-                logger.info("🔁 Starting full poll loop (Ctrl+C to stop)...")
-                poll_live_fixtures(col, session, [target])
-            return
-
-        # ── NORMAL MODE ───────────────────────────────────────────────────
-        live_now = get_live_fixtures(all_fixtures)
-
-        if live_now:
-            logger.info(f"🔴 {len(live_now)} game(s) live — starting poller")
-            session = make_session()
-            poll_live_fixtures(col, session, live_now)
-            all_fixtures = get_upcoming_fixtures(col)
-
-        # ── SCHEDULING ────────────────────────────────────────────────────
-        next_ko = get_next_kickoff(all_fixtures)
-
-        if not next_ko:
-            logger.info("📭 No more upcoming fixtures")
-            if CAN_USE_CRON:
-                remove_from_cron()
-            elif continuous_mode:
-                logger.info("💤 No games — sleeping 6 hours")
-                time.sleep(21600)
-            return
-
-        if continuous_mode:
-            # Smart sleep until next important event
-            smart_sleep_until_next_game(all_fixtures)
-        else:
-            # Cron mode
-            wake_at = next_ko - timedelta(minutes=PRE_KICKOFF_MINS)
-            eat_ko = next_ko + NAIROBI_OFFSET
-
-            if wake_at <= now_utc:
-                wake_at = now_utc + timedelta(minutes=5)
-                logger.info(f"⏰ Kick-off soon ({eat_ko.strftime('%H:%M')} EAT) — waking in 5 mins")
-            else:
-                logger.info(
-                    f"📅 Next kick-off: {eat_ko.strftime('%Y-%m-%d %H:%M')} EAT — "
-                    f"waking at {(wake_at + NAIROBI_OFFSET).strftime('%H:%M')} EAT"
-                )
-            reschedule_cron(wake_at)
-
-    except KeyboardInterrupt:
-        logger.info("\n⏹️ Stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}", exc_info=True)
-        sys.exit(1)
+                    # No live games — smart sleep until next game
+                    smart_sleep_until_next_event(col)
+                    
+            except KeyboardInterrupt:
+                logger.info("\n⏹️ Received interrupt, shutting down...")
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in main loop: {e}", exc_info=True)
+                # Sleep a bit before retrying to avoid spam
+                time.sleep(60)
+                
     finally:
         mongo_client.close()
         logger.info("🔌 MongoDB connection closed")
 
-    logger.info("✅ Done")
-
 
 if __name__ == "__main__":
-    main()
+    main_loop()
+
