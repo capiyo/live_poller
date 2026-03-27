@@ -1,15 +1,10 @@
 """
-FanClash Live Score Poller — Render Edition
-=============================================
-Designed to run as a Render Background Worker (Linux).
-- Reads kick-off times from MongoDB (date_iso + time fields)
-- Self-schedules via Linux crontab
-- Only polls when games are actually live
-- Updates scores, resolves first_goal prop bets
-- Fans out push notifications to voters
-
-Deploy: Render Background Worker
-Start command: bash start.sh
+FanClash Live Score Poller — Render Edition (Smart Sleep Version)
+==================================================================
+- Preserves ALL core functionality (goal detection, notifications, cron)
+- Falls back to smart sleep when cron unavailable (Render)
+- Zero CPU usage between checks
+- Same MongoDB structure, same API calls, same push notifications
 """
 
 import time
@@ -25,7 +20,7 @@ import requests as std_requests
 from pymongo import MongoClient
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG  —  set via Render Environment Variables, fallback to defaults
+# CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATABASE_URL    = os.environ.get("DATABASE_URL",    "mongodb+srv://Capiyo:Capiyo%401010@cluster0.22lay5z.mongodb.net/clashdb?retryWrites=true&w=majority&appName=Cluster0")
@@ -33,14 +28,16 @@ FANCLASH_API    = os.environ.get("FANCLASH_API",    "https://fanclash-api.onrend
 SOFASCORE_API   = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME  = "https://www.sofascore.com"
 
-# Absolute path on Render's container — never changes
-POLLER_SCRIPT_PATH = "/app/live_poller.py"
+POLLER_SCRIPT_PATH = "/poller/live_poller.py"
 PYTHON_PATH        = sys.executable
 
 NAIROBI_OFFSET    = timedelta(hours=3)
-POLL_INTERVAL_SEC = 60    # seconds between score checks while live
-PRE_KICKOFF_MINS  = 30    # wake up this many mins before kick-off
-LIVE_WINDOW_MINS  = 120   # treat match as potentially live for this long after kick-off
+POLL_INTERVAL_SEC = 60
+PRE_KICKOFF_MINS  = 30
+LIVE_WINDOW_MINS  = 120
+
+# Detect if we're on Render (no cron access)
+CAN_USE_CRON = os.path.exists("/usr/bin/crontab") and not os.environ.get("RENDER")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -71,26 +68,19 @@ def connect_db():
 
 
 def get_kickoff_utc(fixture: dict) -> Optional[datetime]:
-    """
-    Build UTC datetime from date_iso + time (stored as EAT = UTC+3).
-    date_iso = "2026-04-08"
-    time     = "19:45"
-    """
     try:
         date_str = fixture.get("date_iso", "")
         time_str = fixture.get("time", "00:00")
         if not date_str:
             return None
         naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        # Stored as EAT (UTC+3) → subtract 3h to get UTC
         return (naive - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
     except Exception as e:
-        logger.warning(f"⚠️  Could not parse kick-off for {fixture.get('match_id')}: {e}")
+        logger.warning(f"⚠️ Could not parse kick-off: {e}")
         return None
 
 
 def get_upcoming_fixtures(col) -> list:
-    """All non-finished fixtures, sorted by kick-off, with _kickoff_utc attached."""
     fixtures = list(col.find(
         {"status": {"$in": ["upcoming", "live"]}},
         sort=[("date_iso", 1), ("time", 1)],
@@ -105,7 +95,6 @@ def get_upcoming_fixtures(col) -> list:
 
 
 def get_live_fixtures(fixtures: list) -> list:
-    """Fixtures currently inside their live window."""
     now = datetime.now(timezone.utc)
     return [
         f for f in fixtures
@@ -114,17 +103,15 @@ def get_live_fixtures(fixtures: list) -> list:
 
 
 def get_next_kickoff(fixtures: list) -> Optional[datetime]:
-    """Earliest future kick-off."""
     now = datetime.now(timezone.utc)
     future = [f["_kickoff_utc"] for f in fixtures if f["_kickoff_utc"] > now]
     return min(future) if future else None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CRON SELF-SCHEDULER  (Linux crontab)
+# CRON SELF-SCHEDULER (only if available)
 # ─────────────────────────────────────────────────────────────────────────────
 
 CRON_MARKER = "# fanclash-live-poller"
-
 
 def _read_crontab() -> list:
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
@@ -132,14 +119,14 @@ def _read_crontab() -> list:
         return []
     return result.stdout.splitlines()
 
-
 def _write_crontab(lines: list):
     new_crontab = "\n".join(lines) + "\n"
     subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
 
-
 def reschedule_cron(run_at: datetime):
-    """Set cron to fire once at run_at (UTC — Render containers run UTC)."""
+    if not CAN_USE_CRON:
+        logger.info(f"📅 Would schedule for {run_at.strftime('%Y-%m-%d %H:%M')} UTC (cron unavailable, using sleep)")
+        return
     lines = [l for l in _read_crontab() if CRON_MARKER not in l]
     cron_line = (
         f"{run_at.minute} {run_at.hour} "
@@ -150,17 +137,54 @@ def reschedule_cron(run_at: datetime):
     lines.append(cron_line)
     _write_crontab(lines)
     eat = run_at + NAIROBI_OFFSET
-    logger.info(f"📅 Cron rescheduled → {eat.strftime('%Y-%m-%d %H:%M')} EAT  ({run_at.strftime('%H:%M')} UTC)")
-
+    logger.info(f"📅 Cron rescheduled → {eat.strftime('%Y-%m-%d %H:%M')} EAT")
 
 def remove_from_cron():
-    """Remove the poller entry — nothing left to watch."""
+    if not CAN_USE_CRON:
+        logger.info("🗑️ Cron removal skipped (cron unavailable)")
+        return
     lines = [l for l in _read_crontab() if CRON_MARKER not in l]
     _write_crontab(lines)
-    logger.info("🗑️  Removed from crontab — no upcoming fixtures")
+    logger.info("🗑️ Removed from crontab")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOFASCORE  —  live score fetch
+# SMART SLEEP (for Render)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def smart_sleep_until_next_game(fixtures: list):
+    """Sleep exactly until the next important event"""
+    
+    if not fixtures:
+        logger.info("💤 No upcoming fixtures — sleeping 6 hours")
+        time.sleep(21600)  # 6 hours
+        return
+    
+    now = datetime.now(timezone.utc)
+    next_ko = get_next_kickoff(fixtures)
+    
+    if not next_ko:
+        logger.info("💤 No future kick-offs — sleeping 6 hours")
+        time.sleep(21600)
+        return
+    
+    # Calculate when to wake up (30 mins before kick-off)
+    wake_at = next_ko - timedelta(minutes=PRE_KICKOFF_MINS)
+    
+    if wake_at <= now:
+        # Game is imminent or already started
+        logger.info(f"⚽ Game imminent — waking in 30 seconds")
+        time.sleep(30)
+        return
+    
+    # Sleep until wake time
+    sleep_seconds = (wake_at - now).total_seconds()
+    wake_eat = wake_at + NAIROBI_OFFSET
+    
+    logger.info(f"💤 Sleeping until {wake_eat.strftime('%Y-%m-%d %H:%M')} EAT ({sleep_seconds/3600:.1f} hours)")
+    time.sleep(sleep_seconds)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOFASCORE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_session() -> cffi_requests.Session:
@@ -171,9 +195,9 @@ def make_session() -> cffi_requests.Session:
     except Exception:
         pass
     session.headers.update({
-        "Accept":  "application/json, text/plain, */*",
+        "Accept": "application/json, text/plain, */*",
         "Referer": f"{SOFASCORE_HOME}/",
-        "Origin":  SOFASCORE_HOME,
+        "Origin": SOFASCORE_HOME,
     })
     return session
 
@@ -183,17 +207,17 @@ def fetch_live_score(session: cffi_requests.Session, sofascore_id: int) -> Optio
         time.sleep(1)
         resp = session.get(f"{SOFASCORE_API}/event/{sofascore_id}", timeout=15)
         if resp.status_code != 200:
-            logger.warning(f"⚠️  Sofascore {resp.status_code} for event {sofascore_id}")
+            logger.warning(f"⚠️ Sofascore {resp.status_code} for event {sofascore_id}")
             return None
         event = resp.json().get("event", {})
         return {
-            "home_score":  (event.get("homeScore") or {}).get("current"),
-            "away_score":  (event.get("awayScore") or {}).get("current"),
+            "home_score": (event.get("homeScore") or {}).get("current"),
+            "away_score": (event.get("awayScore") or {}).get("current"),
             "status_type": (event.get("status") or {}).get("type", ""),
             "status_code": (event.get("status") or {}).get("code", 0),
         }
     except Exception as e:
-        logger.warning(f"⚠️  Error fetching event {sofascore_id}: {e}")
+        logger.warning(f"⚠️ Error fetching event {sofascore_id}: {e}")
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,20 +251,20 @@ def update_fixture_score(col, fixture: dict, new_data: dict, scorer: Optional[st
     new_status = get_match_status(new_data["status_type"], new_data["status_code"])
     update = {
         "$set": {
-            "home_score":           new_data["home_score"],
-            "away_score":           new_data["away_score"],
-            "status":               new_status,
-            "is_live":              new_status == "live",
+            "home_score": new_data["home_score"],
+            "away_score": new_data["away_score"],
+            "status": new_status,
+            "is_live": new_status == "live",
             "available_for_voting": new_status == "upcoming",
         }
     }
     if scorer:
         update["$push"] = {
             "goal_events": {
-                "scorer":     scorer,
+                "scorer": scorer,
                 "home_score": new_data["home_score"],
                 "away_score": new_data["away_score"],
-                "timestamp":  datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         }
     col.update_one({"match_id": fixture["match_id"]}, update)
@@ -251,16 +275,15 @@ def update_fixture_score(col, fixture: dict, new_data: dict, scorer: Optional[st
 
 
 def resolve_first_goal_prop(col, fixture: dict, scorer: str):
-    """Resolve first_goal prop — only on the very first goal of the match."""
     if (fixture.get("home_score") or 0) == 0 and (fixture.get("away_score") or 0) == 0:
         match_id = fixture["match_id"]
         col.database["sub_fixture_results"].update_one(
             {"sub_fixture_id": f"goal_{match_id}"},
             {"$set": {
                 "sub_fixture_id": f"goal_{match_id}",
-                "result":         scorer,
-                "resolved_at":    datetime.now(timezone.utc).isoformat(),
-                "match_id":       match_id,
+                "result": scorer,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "match_id": match_id,
             }},
             upsert=True,
         )
@@ -278,7 +301,7 @@ def fetch_voters(match_id: str) -> list:
             all_votes = data.get("data", []) if isinstance(data, dict) else data
             return [v for v in all_votes if v.get("fixtureId") == match_id]
     except Exception as e:
-        logger.warning(f"⚠️  Could not fetch voters for {match_id}: {e}")
+        logger.warning(f"⚠️ Could not fetch voters for {match_id}: {e}")
     return []
 
 
@@ -287,61 +310,61 @@ def send_push(user_id: str, title: str, body: str, data: dict):
         std_requests.post(
             f"{FANCLASH_API}/notifications/send",
             json={
-                "userId":           user_id,
+                "userId": user_id,
                 "notificationType": data.get("type", "goal_update"),
-                "title":            title,
-                "body":             body,
-                "data":             data,
+                "title": title,
+                "body": body,
+                "data": data,
             },
             timeout=10,
         )
     except Exception as e:
-        logger.warning(f"⚠️  Push failed for {user_id}: {e}")
+        logger.warning(f"⚠️ Push failed for {user_id}: {e}")
 
 
 def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
-    match_id     = fixture["match_id"]
-    home_team    = fixture["home_team"]
-    away_team    = fixture["away_team"]
+    match_id = fixture["match_id"]
+    home_team = fixture["home_team"]
+    away_team = fixture["away_team"]
     fixture_name = f"{home_team} vs {away_team}"
-    score_line   = f"{new_home}-{new_away}"
-    scored_team  = home_team if scorer == "home_team" else away_team
-    now_iso      = datetime.now(timezone.utc).isoformat()
+    score_line = f"{new_home}-{new_away}"
+    scored_team = home_team if scorer == "home_team" else away_team
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     voters = fetch_voters(match_id)
     if not voters:
-        logger.info(f"ℹ️  No voters to notify for {fixture_name}")
+        logger.info(f"ℹ️ No voters to notify for {fixture_name}")
         return
 
     notified = 0
     for vote in voters:
-        user_id   = vote.get("voterId", "")
+        user_id = vote.get("voterId", "")
         selection = vote.get("selection", "")
         if not user_id:
             continue
 
         if selection == scorer:
             title = f"⚽ {scored_team} scored!"
-            body  = f"{fixture_name} → {score_line}. Your pick is winning! 😤"
+            body = f"{fixture_name} → {score_line}. Your pick is winning! 😤"
             ntype = "goal_your_team"
         elif selection == "draw":
             title = f"⚽ Goal! {scored_team} score"
-            body  = f"{fixture_name} → {score_line}. Your draw is under pressure 😬"
+            body = f"{fixture_name} → {score_line}. Your draw is under pressure 😬"
             ntype = "goal_draw_pressure"
         else:
             title = f"⚔️ {scored_team} scored against you!"
-            body  = f"{fixture_name} → {score_line}. Rivals are coming for you! 😈"
+            body = f"{fixture_name} → {score_line}. Rivals are coming for you! 😈"
             ntype = "goal_rival_team"
 
         send_push(user_id, title, body, {
-            "type":       ntype,
+            "type": ntype,
             "fixture_id": match_id,
-            "scorer":     scorer,
+            "scorer": scorer,
             "home_score": new_home,
             "away_score": new_away,
-            "home_team":  home_team,
-            "away_team":  away_team,
-            "timestamp":  now_iso,
+            "home_team": home_team,
+            "away_team": away_team,
+            "timestamp": now_iso,
         })
         notified += 1
         time.sleep(0.05)
@@ -349,7 +372,7 @@ def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
     logger.info(f"📲 Notified {notified} voters — {fixture_name}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE POLL LOOP
+# CORE POLL LOOP (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list):
@@ -397,14 +420,16 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
     logger.info("🏁 All live games finished")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN (with smart sleep fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     test_mode = "--test" in sys.argv
+    continuous_mode = os.environ.get("CONTINUOUS_MODE") == "true" or not CAN_USE_CRON
 
     logger.info("=" * 55)
-    logger.info(f"⚽  FanClash Live Poller {'[TEST MODE]' if test_mode else ''}")
+    logger.info(f"⚽ FanClash Live Poller {'[TEST MODE]' if test_mode else ''}")
+    logger.info(f"📡 Mode: {'Continuous (smart sleep)' if continuous_mode else 'Cron-scheduled'}")
     logger.info("=" * 55)
 
     mongo_client, col = connect_db()
@@ -415,7 +440,7 @@ def main():
 
         if not all_fixtures:
             logger.info("📭 No upcoming fixtures in DB")
-            if not test_mode:
+            if not test_mode and CAN_USE_CRON:
                 remove_from_cron()
             return
 
@@ -448,7 +473,7 @@ def main():
                     scorer = detect_scorer(target, live_data)
                     logger.info(f"🔍 Score change detected: {scorer or 'none'}")
                 else:
-                    logger.warning("⚠️  No live data — game not live yet on Sofascore")
+                    logger.warning("⚠️ No live data — game not live yet on Sofascore")
 
             if "--loop" in sys.argv:
                 logger.info("🔁 Starting full poll loop (Ctrl+C to stop)...")
@@ -464,29 +489,38 @@ def main():
             poll_live_fixtures(col, session, live_now)
             all_fixtures = get_upcoming_fixtures(col)
 
+        # ── SCHEDULING ────────────────────────────────────────────────────
         next_ko = get_next_kickoff(all_fixtures)
 
         if not next_ko:
-            logger.info("📭 No more upcoming fixtures — removing from cron")
-            remove_from_cron()
+            logger.info("📭 No more upcoming fixtures")
+            if CAN_USE_CRON:
+                remove_from_cron()
+            elif continuous_mode:
+                logger.info("💤 No games — sleeping 6 hours")
+                time.sleep(21600)
             return
 
-        wake_at = next_ko - timedelta(minutes=PRE_KICKOFF_MINS)
-        eat_ko  = next_ko + NAIROBI_OFFSET
-
-        if wake_at <= now_utc:
-            wake_at = now_utc + timedelta(minutes=5)
-            logger.info(f"⏰ Kick-off very soon ({eat_ko.strftime('%H:%M')} EAT) — waking in 5 mins")
+        if continuous_mode:
+            # Smart sleep until next important event
+            smart_sleep_until_next_game(all_fixtures)
         else:
-            logger.info(
-                f"📅 Next kick-off: {eat_ko.strftime('%Y-%m-%d %H:%M')} EAT — "
-                f"waking at {(wake_at + NAIROBI_OFFSET).strftime('%H:%M')} EAT"
-            )
+            # Cron mode
+            wake_at = next_ko - timedelta(minutes=PRE_KICKOFF_MINS)
+            eat_ko = next_ko + NAIROBI_OFFSET
 
-        reschedule_cron(wake_at)
+            if wake_at <= now_utc:
+                wake_at = now_utc + timedelta(minutes=5)
+                logger.info(f"⏰ Kick-off soon ({eat_ko.strftime('%H:%M')} EAT) — waking in 5 mins")
+            else:
+                logger.info(
+                    f"📅 Next kick-off: {eat_ko.strftime('%Y-%m-%d %H:%M')} EAT — "
+                    f"waking at {(wake_at + NAIROBI_OFFSET).strftime('%H:%M')} EAT"
+                )
+            reschedule_cron(wake_at)
 
     except KeyboardInterrupt:
-        logger.info("\n⏹️  Stopped by user")
+        logger.info("\n⏹️ Stopped by user")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
         sys.exit(1)
