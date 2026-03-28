@@ -1,12 +1,13 @@
 """
-FanClash Live Score Poller — Render Free Tier Edition
-======================================================
+FanClash Live Score Poller — Render Free Tier Edition (Fixed)
+==============================================================
 Runs as a Render Web Service (free tier) by opening a tiny
 health-check HTTP server on the required port. The actual
 poller logic runs on a background thread alongside it.
 
 Notification timeline:
   T-60  → "🔔 Kick-off in 1 hour"
+  T-45  → "⏰ 45 minutes to kick-off"
   T-30  → "⚡ 30 mins to go"
   T-10  → "🔥 Last chance to vote"
   T+0   → "⚽ We are LIVE"
@@ -137,13 +138,16 @@ def get_next_kickoff(fixtures: list) -> Optional[datetime]:
     return min(future) if future else None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMART SLEEP
+# SMART SLEEP (FIXED - handles all time windows correctly)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def smart_sleep(col):
     """
-    Sleep until 60 mins before the next kick-off.
-    Caps at 1 hour so we re-check for newly scraped fixtures regularly.
+    Smart sleep that handles all game time windows:
+    - Game live or within 5 mins → no sleep, poll immediately
+    - Game within 30 mins → sleep 5 mins, check frequently
+    - Game within 60 mins → sleep until 30 mins before
+    - Game more than 60 mins → sleep until 60 mins before (max 1 hour)
     """
     all_fixtures = get_upcoming_fixtures(col)
 
@@ -152,7 +156,7 @@ def smart_sleep(col):
         time.sleep(21600)
         return
 
-    now     = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     next_ko = get_next_kickoff(all_fixtures)
 
     if not next_ko:
@@ -160,19 +164,47 @@ def smart_sleep(col):
         time.sleep(21600)
         return
 
-    wake_at    = next_ko - timedelta(minutes=60)
-    eat_ko     = next_ko + NAIROBI_OFFSET
-    sleep_secs = (wake_at - now).total_seconds()
+    mins_to_kickoff = (next_ko - now).total_seconds() / 60
+    kickoff_eat = (next_ko + NAIROBI_OFFSET).strftime('%Y-%m-%d %H:%M')
 
-    if sleep_secs <= 0:
-        return  # already past T-60 — check immediately
+    # Case 1: Game is live or within 5 mins
+    if mins_to_kickoff <= 5:
+        if mins_to_kickoff > 0:
+            logger.info(f"⚽ Game in {mins_to_kickoff:.0f} mins — starting immediate poll")
+        else:
+            logger.info(f"⚽ Game is LIVE — starting poller")
+        return  # Don't sleep, check immediately
 
-    sleep_secs = min(sleep_secs, 3600)  # max 1 hour per sleep
-    logger.info(
-        f"💤 Next game: {eat_ko.strftime('%Y-%m-%d %H:%M')} EAT — "
-        f"sleeping {sleep_secs/3600:.1f}h"
-    )
-    time.sleep(sleep_secs)
+    # Case 2: Game is within 30 mins (but > 5 mins)
+    elif mins_to_kickoff <= 30:
+        sleep_mins = min(5, mins_to_kickoff - 1)  # Sleep 5 mins or until 1 min before
+        logger.info(f"⏰ Game in {mins_to_kickoff:.0f} mins — checking every {sleep_mins:.0f} mins")
+        time.sleep(sleep_mins * 60)
+        return
+
+    # Case 3: Game is between 30-60 mins away
+    elif mins_to_kickoff <= 60:
+        wake_at = next_ko - timedelta(minutes=30)
+        sleep_secs = (wake_at - now).total_seconds()
+        sleep_secs = max(sleep_secs, 60)  # At least 1 minute
+        wake_eat = (wake_at + NAIROBI_OFFSET).strftime('%H:%M')
+        logger.info(
+            f"💤 Game at {kickoff_eat} EAT ({mins_to_kickoff:.0f} mins away) — "
+            f"sleeping until {wake_eat} EAT ({sleep_secs/60:.0f} mins)"
+        )
+        time.sleep(sleep_secs)
+
+    # Case 4: Game is more than 60 mins away
+    else:
+        wake_at = next_ko - timedelta(minutes=60)
+        sleep_secs = (wake_at - now).total_seconds()
+        sleep_secs = min(sleep_secs, 3600)  # Max 1 hour
+        wake_eat = (wake_at + NAIROBI_OFFSET).strftime('%H:%M')
+        logger.info(
+            f"💤 Next game: {kickoff_eat} EAT — "
+            f"sleeping until {wake_eat} EAT ({sleep_secs/3600:.1f}h)"
+        )
+        time.sleep(sleep_secs)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SOFASCORE
@@ -265,10 +297,11 @@ def notify_all_voters(fixture: dict, title: str, body: str, ntype: str, extra: d
         })
         sent += 1
         time.sleep(0.05)
-    logger.info(f"📲 [{ntype}] → {sent} voters | {fixture['home_team']} vs {fixture['away_team']}")
+    if sent > 0:
+        logger.info(f"📲 [{ntype}] → {sent} voters | {fixture['home_team']} vs {fixture['away_team']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COUNTDOWN NOTIFICATIONS  (T-60 / T-30 / T-10 / kick-off)
+# COUNTDOWN NOTIFICATIONS (FIXED - added T-45, improved ranges)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _sent_alerts: dict = {}  # match_id → set of alert names already sent
@@ -283,15 +316,16 @@ def _mark_sent(match_id: str, alert: str):
 
 
 def send_countdown_notifications(fixture: dict):
-    now      = datetime.now(timezone.utc)
-    ko       = fixture["_kickoff_utc"]
-    mins_to  = (ko - now).total_seconds() / 60
+    now = datetime.now(timezone.utc)
+    ko = fixture["_kickoff_utc"]
+    mins_to = (ko - now).total_seconds() / 60
     match_id = fixture["match_id"]
-    home     = fixture["home_team"]
-    away     = fixture["away_team"]
-    name     = f"{home} vs {away}"
-    ko_eat   = (ko + NAIROBI_OFFSET).strftime("%H:%M")
+    home = fixture["home_team"]
+    away = fixture["away_team"]
+    name = f"{home} vs {away}"
+    ko_eat = (ko + NAIROBI_OFFSET).strftime("%H:%M")
 
+    # T-60 (55-65 mins)
     if 55 <= mins_to <= 65 and not _already_sent(match_id, "t60"):
         notify_all_voters(fixture,
             title=f"🔔 1 hour until kick-off!",
@@ -301,6 +335,17 @@ def send_countdown_notifications(fixture: dict):
         )
         _mark_sent(match_id, "t60")
 
+    # T-45 (40-50 mins) - NEW!
+    elif 40 <= mins_to <= 50 and not _already_sent(match_id, "t45"):
+        notify_all_voters(fixture,
+            title=f"⏰ 45 minutes to kick-off!",
+            body=f"{name} at {ko_eat} EAT — get your votes in! 🎯",
+            ntype="kickoff_reminder_45",
+            extra={"mins_to_kickoff": 45},
+        )
+        _mark_sent(match_id, "t45")
+
+    # T-30 (25-35 mins)
     elif 25 <= mins_to <= 35 and not _already_sent(match_id, "t30"):
         notify_all_voters(fixture,
             title=f"⚡ 30 minutes to go!",
@@ -310,6 +355,7 @@ def send_countdown_notifications(fixture: dict):
         )
         _mark_sent(match_id, "t30")
 
+    # T-10 (5-15 mins)
     elif 5 <= mins_to <= 15 and not _already_sent(match_id, "t10"):
         notify_all_voters(fixture,
             title=f"🔥 10 minutes! Last chance to vote!",
@@ -319,6 +365,7 @@ def send_countdown_notifications(fixture: dict):
         )
         _mark_sent(match_id, "t10")
 
+    # Kickoff (-5 to 5 mins)
     elif -5 <= mins_to <= 5 and not _already_sent(match_id, "kickoff"):
         notify_all_voters(fixture,
             title=f"⚽ We are LIVE!",
@@ -330,7 +377,8 @@ def send_countdown_notifications(fixture: dict):
 
 
 def run_countdown_for_upcoming(col, upcoming_fixtures: list):
-    now  = datetime.now(timezone.utc)
+    """Send countdown notifications for games within 65 mins of kickoff."""
+    now = datetime.now(timezone.utc)
     soon = [
         f for f in upcoming_fixtures
         if 0 < (f["_kickoff_utc"] - now).total_seconds() / 60 <= 65
@@ -389,7 +437,8 @@ def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
         sent += 1
         time.sleep(0.05)
 
-    logger.info(f"📲 [goal] {sent} voters — {name} {score_line}")
+    if sent > 0:
+        logger.info(f"📲 [goal] {sent} voters — {name} {score_line}")
 
 
 def notify_half_time(fixture: dict, home_score: int, away_score: int):
@@ -451,7 +500,8 @@ def notify_full_time(fixture: dict, home_score: int, away_score: int):
         sent += 1
         time.sleep(0.05)
 
-    logger.info(f"📲 [full_time] {sent} voters — {name} {score}")
+    if sent > 0:
+        logger.info(f"📲 [full_time] {sent} voters — {name} {score}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INCIDENT TRACKER  (yellow / corner / offside)
@@ -641,13 +691,14 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
     logger.info("✅ All live games finished")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     logger.info("=" * 55)
-    logger.info("⚽  FanClash Live Poller — Match Day Edition")
+    logger.info("⚽  FanClash Live Poller — Match Day Edition (Fixed)")
     logger.info("🌐  Running as Render Web Service (free tier)")
+    logger.info("📢  Notifications: T-60, T-45, T-30, T-10, Kickoff, Goals, Cards, Corners, Offside, HT, FT")
     logger.info("=" * 55)
 
     # Start health server first so Render sees an open port immediately
