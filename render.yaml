@@ -1,16 +1,16 @@
 services:
-  - type: worker                    # ← MUST be worker, NOT web
+  - type: web                       # ← web (free tier) not worker
     name: fanclash-live-poller
     runtime: python
     region: frankfurt
-    plan: starter                   # free tier spins down — starter stays alive
+    plan: free
     rootDir: .
     buildCommand: pip install -r requirements.txt
     startCommand: python live_poller.py
     envVars:
       - key: DATABASE_URL
-        sync: false                 # set in Render dashboard, keep out of git
+        sync: false                 # set in Render dashboard
       - key: FANCLASH_API
         value: https://fanclash-api.onrender.com/api
       - key: PYTHONUNBUFFERED
-        value: "1"                  # logs appear instantly
+        value: "1"

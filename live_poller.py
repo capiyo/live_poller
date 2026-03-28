@@ -1,29 +1,29 @@
 """
-FanClash Live Score Poller — Full Match Day Edition
-=====================================================
-Notification timeline per fixture:
+FanClash Live Score Poller — Render Free Tier Edition
+======================================================
+Runs as a Render Web Service (free tier) by opening a tiny
+health-check HTTP server on the required port. The actual
+poller logic runs on a background thread alongside it.
 
-  T-60 mins  → "🔔 Kick-off in 1 hour"        (all voters)
-  T-30 mins  → "⚡ 30 mins to go"              (all voters)
-  T-10 mins  → "🔥 10 mins! Last chance to vote" (unvoted users too)
-  T+0        → "⚽ We are LIVE"                (all voters)
-
-  ── LIVE ────────────────────────────────────────────────────────
-  GOAL       → personalised (your team / rival team / draw)
+Notification timeline:
+  T-60  → "🔔 Kick-off in 1 hour"
+  T-30  → "⚡ 30 mins to go"
+  T-10  → "🔥 Last chance to vote"
+  T+0   → "⚽ We are LIVE"
+  GOAL       → personalised (your team / rival / draw)
   YELLOW     → "🟨 Yellow card — {team}"
   CORNER     → "🚩 Corner to {team}"
   OFFSIDE    → "🚩 Offside — {team}"
   HALF TIME  → "⏸ Half time — {score}"
-  FULL TIME  → "🏁 Full time — you were right/wrong + result"
-
-Deploy:  Render Background Worker
-Start:   python live_poller.py
+  FULL TIME  → "🏁 You called it / Not your day"
 """
 
 import time
 import logging
 import sys
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -41,8 +41,8 @@ SOFASCORE_API  = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME = "https://www.sofascore.com"
 
 NAIROBI_OFFSET    = timedelta(hours=3)
-POLL_INTERVAL_SEC = 60    # seconds between score checks while live
-LIVE_WINDOW_MINS  = 120   # treat a match as possibly live for this long after kick-off
+POLL_INTERVAL_SEC = 60
+LIVE_WINDOW_MINS  = 120
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -54,6 +54,29 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH SERVER  (keeps Render free web service alive)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"FanClash Poller OK")
+
+    def log_message(self, *args):
+        pass  # silence noisy access logs
+
+
+def start_health_server():
+    """Start tiny HTTP server on Render's required PORT in a daemon thread."""
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"🌐 Health server listening on port {port}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MONGODB
@@ -120,7 +143,7 @@ def get_next_kickoff(fixtures: list) -> Optional[datetime]:
 def smart_sleep(col):
     """
     Sleep until 60 mins before the next kick-off.
-    Wake up every hour to re-check in case new fixtures were scraped.
+    Caps at 1 hour so we re-check for newly scraped fixtures regularly.
     """
     all_fixtures = get_upcoming_fixtures(col)
 
@@ -129,7 +152,7 @@ def smart_sleep(col):
         time.sleep(21600)
         return
 
-    now = datetime.now(timezone.utc)
+    now     = datetime.now(timezone.utc)
     next_ko = get_next_kickoff(all_fixtures)
 
     if not next_ko:
@@ -137,18 +160,14 @@ def smart_sleep(col):
         time.sleep(21600)
         return
 
-    # Wake at T-60 to send the first notification
-    wake_at = next_ko - timedelta(minutes=60)
-    eat_ko  = next_ko + NAIROBI_OFFSET
-
-    if wake_at <= now:
-        # Already past T-60 — wake up immediately
-        return
-
+    wake_at    = next_ko - timedelta(minutes=60)
+    eat_ko     = next_ko + NAIROBI_OFFSET
     sleep_secs = (wake_at - now).total_seconds()
-    # Cap single sleep at 1 hour so we re-check for new fixtures regularly
-    sleep_secs = min(sleep_secs, 3600)
 
+    if sleep_secs <= 0:
+        return  # already past T-60 — check immediately
+
+    sleep_secs = min(sleep_secs, 3600)  # max 1 hour per sleep
     logger.info(
         f"💤 Next game: {eat_ko.strftime('%Y-%m-%d %H:%M')} EAT — "
         f"sleeping {sleep_secs/3600:.1f}h"
@@ -186,7 +205,6 @@ def fetch_live_score(session: cffi_requests.Session, sofascore_id: int) -> Optio
             "away_score":  (event.get("awayScore") or {}).get("current"),
             "status_type": (event.get("status") or {}).get("type", ""),
             "status_code": (event.get("status") or {}).get("code", 0),
-            # incident data for yellow/corner/offside
             "incidents":   event.get("incidents", []),
         }
     except Exception as e:
@@ -194,22 +212,21 @@ def fetch_live_score(session: cffi_requests.Session, sofascore_id: int) -> Optio
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NOTIFICATIONS — core sender
+# PUSH NOTIFICATIONS — core sender
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_push(user_id: str, title: str, body: str, ntype: str, data: dict):
-    """POST to /api/notifications/send — matches your Rust SendNotificationRequest."""
+    """POST to Rust /api/notifications/send — matches SendNotificationRequest."""
     try:
-        payload = {
-            "user_id":           user_id,       # Rust field: user_id
-            "notification_type": ntype,          # Rust field: notification_type
-            "title":             title,
-            "body":              body,
-            "data":              data,
-        }
         std_requests.post(
             f"{FANCLASH_API}/notifications/send",
-            json=payload,
+            json={
+                "user_id":           user_id,
+                "notification_type": ntype,
+                "title":             title,
+                "body":              body,
+                "data":              data,
+            },
             timeout=10,
         )
     except Exception as e:
@@ -217,7 +234,6 @@ def send_push(user_id: str, title: str, body: str, ntype: str, data: dict):
 
 
 def fetch_voters(match_id: str) -> list:
-    """Fetch all votes for a fixture."""
     try:
         resp = std_requests.get(f"{FANCLASH_API}/votes/votes", timeout=10)
         if resp.status_code == 200:
@@ -229,13 +245,13 @@ def fetch_voters(match_id: str) -> list:
     return []
 
 
-def notify_all_voters(fixture: dict, title: str, body: str, ntype: str, extra_data: dict = {}):
-    """Send the same notification to every voter of this fixture."""
+def notify_all_voters(fixture: dict, title: str, body: str, ntype: str, extra: dict = {}):
+    """Same notification to every unique voter of a fixture."""
     voters = fetch_voters(fixture["match_id"])
     if not voters:
         return
-    sent = 0
     seen = set()
+    sent = 0
     for vote in voters:
         uid = vote.get("voterId", "")
         if not uid or uid in seen:
@@ -245,19 +261,17 @@ def notify_all_voters(fixture: dict, title: str, body: str, ntype: str, extra_da
             "fixture_id": fixture["match_id"],
             "home_team":  fixture["home_team"],
             "away_team":  fixture["away_team"],
-            **extra_data,
+            **extra,
         })
         sent += 1
         time.sleep(0.05)
-    logger.info(f"📲 [{ntype}] Notified {sent} voters — {fixture['home_team']} vs {fixture['away_team']}")
+    logger.info(f"📲 [{ntype}] → {sent} voters | {fixture['home_team']} vs {fixture['away_team']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MATCH DAY NOTIFICATION TIMELINE
+# COUNTDOWN NOTIFICATIONS  (T-60 / T-30 / T-10 / kick-off)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Track which pre-kickoff alerts have already been sent
-# key = match_id, value = set of alert names sent
-_sent_alerts: dict = {}
+_sent_alerts: dict = {}  # match_id → set of alert names already sent
 
 
 def _already_sent(match_id: str, alert: str) -> bool:
@@ -269,10 +283,6 @@ def _mark_sent(match_id: str, alert: str):
 
 
 def send_countdown_notifications(fixture: dict):
-    """
-    Check how far away kick-off is and send the appropriate countdown alert.
-    Idempotent — each alert fires exactly once per fixture.
-    """
     now      = datetime.now(timezone.utc)
     ko       = fixture["_kickoff_utc"]
     mins_to  = (ko - now).total_seconds() / 60
@@ -282,66 +292,71 @@ def send_countdown_notifications(fixture: dict):
     name     = f"{home} vs {away}"
     ko_eat   = (ko + NAIROBI_OFFSET).strftime("%H:%M")
 
-    # T-60
     if 55 <= mins_to <= 65 and not _already_sent(match_id, "t60"):
         notify_all_voters(fixture,
             title=f"🔔 1 hour until kick-off!",
-            body=f"{name} kicks off at {ko_eat} EAT. Pick your side!",
+            body=f"{name} kicks off at {ko_eat} EAT. Pick your side! ⚽",
             ntype="kickoff_reminder_60",
-            extra_data={"mins_to_kickoff": 60},
+            extra={"mins_to_kickoff": 60},
         )
         _mark_sent(match_id, "t60")
 
-    # T-30
     elif 25 <= mins_to <= 35 and not _already_sent(match_id, "t30"):
         notify_all_voters(fixture,
             title=f"⚡ 30 minutes to go!",
-            body=f"{name} — rivalries heating up. Who's winning this?",
+            body=f"{name} — rivalries heating up. Who's winning this? 🔥",
             ntype="kickoff_reminder_30",
-            extra_data={"mins_to_kickoff": 30},
+            extra={"mins_to_kickoff": 30},
         )
         _mark_sent(match_id, "t30")
 
-    # T-10
     elif 5 <= mins_to <= 15 and not _already_sent(match_id, "t10"):
         notify_all_voters(fixture,
             title=f"🔥 10 minutes! Last chance to vote!",
-            body=f"{name} — vote now before kick-off locks!",
+            body=f"{name} — locks soon. Don't miss out! ⏰",
             ntype="kickoff_reminder_10",
-            extra_data={"mins_to_kickoff": 10},
+            extra={"mins_to_kickoff": 10},
         )
         _mark_sent(match_id, "t10")
 
-    # KICK-OFF  (within 5 mins of start)
     elif -5 <= mins_to <= 5 and not _already_sent(match_id, "kickoff"):
         notify_all_voters(fixture,
             title=f"⚽ We are LIVE!",
             body=f"{home} vs {away} has kicked off. May the best pick win! 🏆",
             ntype="kickoff_live",
-            extra_data={"mins_to_kickoff": 0},
+            extra={"mins_to_kickoff": 0},
         )
         _mark_sent(match_id, "kickoff")
+
+
+def run_countdown_for_upcoming(col, upcoming_fixtures: list):
+    now  = datetime.now(timezone.utc)
+    soon = [
+        f for f in upcoming_fixtures
+        if 0 < (f["_kickoff_utc"] - now).total_seconds() / 60 <= 65
+    ]
+    for fixture in soon:
+        send_countdown_notifications(fixture)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LIVE EVENT NOTIFICATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
-    """Personalised goal alert — different message per vote selection."""
-    match_id     = fixture["match_id"]
-    home_team    = fixture["home_team"]
-    away_team    = fixture["away_team"]
-    name         = f"{home_team} vs {away_team}"
-    score_line   = f"{new_home}-{new_away}"
-    scored_team  = home_team if scorer == "home_team" else away_team
-    now_iso      = datetime.now(timezone.utc).isoformat()
+    match_id    = fixture["match_id"]
+    home_team   = fixture["home_team"]
+    away_team   = fixture["away_team"]
+    name        = f"{home_team} vs {away_team}"
+    score_line  = f"{new_home}-{new_away}"
+    scored_team = home_team if scorer == "home_team" else away_team
+    now_iso     = datetime.now(timezone.utc).isoformat()
 
     voters = fetch_voters(match_id)
     if not voters:
         return
 
-    sent = 0
     seen = set()
+    sent = 0
     for vote in voters:
         uid       = vote.get("voterId", "")
         selection = vote.get("selection", "")
@@ -374,52 +389,20 @@ def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
         sent += 1
         time.sleep(0.05)
 
-    logger.info(f"📲 [goal] Notified {sent} voters — {name} {score_line}")
-
-
-def notify_yellow_card(fixture: dict, team: str, score_line: str):
-    name = f"{fixture['home_team']} vs {fixture['away_team']}"
-    notify_all_voters(fixture,
-        title=f"🟨 Yellow card — {team}",
-        body=f"{name} → {score_line}. Things are heating up! 🔥",
-        ntype="yellow_card",
-        extra_data={"team": team, "score": score_line},
-    )
-
-
-def notify_corner(fixture: dict, team: str, score_line: str):
-    name = f"{fixture['home_team']} vs {fixture['away_team']}"
-    notify_all_voters(fixture,
-        title=f"🚩 Corner to {team}",
-        body=f"{name} → {score_line}. Dangerous set piece! 😤",
-        ntype="corner",
-        extra_data={"team": team, "score": score_line},
-    )
-
-
-def notify_offside(fixture: dict, team: str, score_line: str):
-    name = f"{fixture['home_team']} vs {fixture['away_team']}"
-    notify_all_voters(fixture,
-        title=f"🚩 Offside — {team}",
-        body=f"{name} → {score_line}",
-        ntype="offside",
-        extra_data={"team": team, "score": score_line},
-    )
+    logger.info(f"📲 [goal] {sent} voters — {name} {score_line}")
 
 
 def notify_half_time(fixture: dict, home_score: int, away_score: int):
-    name = f"{fixture['home_team']} vs {fixture['away_team']}"
     score = f"{home_score}-{away_score}"
     notify_all_voters(fixture,
         title=f"⏸ Half time — {score}",
-        body=f"{name} — 45 more mins. Your pick still alive? 👀",
+        body=f"{fixture['home_team']} vs {fixture['away_team']} — 45 more mins. Still alive? 👀",
         ntype="half_time",
-        extra_data={"home_score": home_score, "away_score": away_score},
+        extra={"home_score": home_score, "away_score": away_score},
     )
 
 
 def notify_full_time(fixture: dict, home_score: int, away_score: int):
-    """Full time — personalised win/loss message per voter."""
     match_id  = fixture["match_id"]
     home_team = fixture["home_team"]
     away_team = fixture["away_team"]
@@ -427,20 +410,19 @@ def notify_full_time(fixture: dict, home_score: int, away_score: int):
     score     = f"{home_score}-{away_score}"
     now_iso   = datetime.now(timezone.utc).isoformat()
 
-    # Determine actual result
     if home_score > away_score:
-        actual_result = "home_team"
+        actual = "home_team"
     elif away_score > home_score:
-        actual_result = "away_team"
+        actual = "away_team"
     else:
-        actual_result = "draw"
+        actual = "draw"
 
     voters = fetch_voters(match_id)
     if not voters:
         return
 
-    sent = 0
     seen = set()
+    sent = 0
     for vote in voters:
         uid       = vote.get("voterId", "")
         selection = vote.get("selection", "")
@@ -448,7 +430,7 @@ def notify_full_time(fixture: dict, home_score: int, away_score: int):
             continue
         seen.add(uid)
 
-        if selection == actual_result:
+        if selection == actual:
             title = f"🏆 You called it!"
             body  = f"{name} {score} — your rivals owe you respect 😎"
             ntype = "full_time_win"
@@ -461,7 +443,7 @@ def notify_full_time(fixture: dict, home_score: int, away_score: int):
             "fixture_id":    match_id,
             "home_score":    home_score,
             "away_score":    away_score,
-            "actual_result": actual_result,
+            "actual_result": actual,
             "home_team":     home_team,
             "away_team":     away_team,
             "timestamp":     now_iso,
@@ -469,33 +451,24 @@ def notify_full_time(fixture: dict, home_score: int, away_score: int):
         sent += 1
         time.sleep(0.05)
 
-    logger.info(f"📲 [full_time] Notified {sent} voters — {name} {score}")
+    logger.info(f"📲 [full_time] {sent} voters — {name} {score}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INCIDENT TRACKER  (yellow / corner / offside dedup)
+# INCIDENT TRACKER  (yellow / corner / offside)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# key = match_id, value = set of incident IDs already processed
-_seen_incidents: dict = {}
+_seen_incidents: dict = {}  # match_id → set of incident IDs already processed
 
 
 def process_incidents(fixture: dict, incidents: list, home_score: int, away_score: int):
-    """
-    Walk Sofascore incident list and fire notifications for new events.
-    Sofascore incident types we care about:
-      - "card"    → incidentClass "yellow"
-      - "corner"
-      - "offside" (not always available)
-    """
-    match_id  = fixture["match_id"]
-    home_team = fixture["home_team"]
-    away_team = fixture["away_team"]
+    match_id   = fixture["match_id"]
+    home_team  = fixture["home_team"]
+    away_team  = fixture["away_team"]
     score_line = f"{home_score}-{away_score}"
-
-    seen = _seen_incidents.setdefault(match_id, set())
+    seen       = _seen_incidents.setdefault(match_id, set())
 
     for inc in incidents:
-        inc_id   = inc.get("id") or str(inc)
+        inc_id   = str(inc.get("id") or id(inc))
         inc_type = (inc.get("incidentType") or "").lower()
         inc_cls  = (inc.get("incidentClass") or "").lower()
         is_home  = inc.get("isHome", True)
@@ -507,15 +480,30 @@ def process_incidents(fixture: dict, incidents: list, home_score: int, away_scor
 
         if inc_type == "card" and inc_cls == "yellow":
             logger.info(f"🟨 Yellow card — {team}")
-            notify_yellow_card(fixture, team, score_line)
+            notify_all_voters(fixture,
+                title=f"🟨 Yellow card — {team}",
+                body=f"{home_team} vs {away_team} → {score_line}. Things heating up! 🔥",
+                ntype="yellow_card",
+                extra={"team": team, "score": score_line},
+            )
 
         elif inc_type == "corner":
             logger.info(f"🚩 Corner — {team}")
-            notify_corner(fixture, team, score_line)
+            notify_all_voters(fixture,
+                title=f"🚩 Corner to {team}",
+                body=f"{home_team} vs {away_team} → {score_line}. Dangerous set piece! 😤",
+                ntype="corner",
+                extra={"team": team, "score": score_line},
+            )
 
         elif inc_type == "offside":
             logger.info(f"🚩 Offside — {team}")
-            notify_offside(fixture, team, score_line)
+            notify_all_voters(fixture,
+                title=f"🚩 Offside — {team}",
+                body=f"{home_team} vs {away_team} → {score_line}",
+                ntype="offside",
+                extra={"team": team, "score": score_line},
+            )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DB UPDATES
@@ -588,14 +576,8 @@ def resolve_first_goal_prop(col, fixture: dict, scorer: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list):
-    """
-    Poll until all live fixtures finish.
-    Handles: goals, yellow cards, corners, offsides, half time, full time.
-    """
-    watch = {f["match_id"]: f for f in live_fixtures}
-
-    # Track half-time state per match
-    half_time_sent: dict = {}
+    watch          = {f["match_id"]: f for f in live_fixtures}
+    half_time_sent = {}
 
     logger.info(f"🔴 Watching {len(watch)} live fixture(s)")
 
@@ -610,21 +592,22 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
             if not live_data:
                 continue
 
-            home_score = live_data.get("home_score") or 0
-            away_score = live_data.get("away_score") or 0
-            score_line = f"{home_score}-{away_score}"
+            home_score  = live_data.get("home_score") or 0
+            away_score  = live_data.get("away_score") or 0
             status_type = live_data["status_type"]
             status_code = live_data["status_code"]
             new_status  = get_match_status(status_type, status_code)
 
-            # ── Goal detection ─────────────────────────────────────────────
+            # Countdown alerts (kick-off notification fires here too)
+            send_countdown_notifications(fixture)
+
+            # Goal
             scorer = detect_scorer(fixture, live_data)
             if scorer:
-                logger.info(f"⚽ GOAL! {fixture['home_team']} vs {fixture['away_team']} → {score_line}")
+                logger.info(f"⚽ GOAL! {fixture['home_team']} vs {fixture['away_team']} → {home_score}-{away_score}")
                 update_fixture_score(col, fixture, live_data, scorer)
                 resolve_first_goal_prop(col, fixture, scorer)
                 notify_goal(fixture, scorer, home_score, away_score)
-
                 refreshed = col.find_one({"match_id": match_id})
                 if refreshed:
                     refreshed["_kickoff_utc"] = fixture.get("_kickoff_utc")
@@ -632,63 +615,43 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
             else:
                 update_fixture_score(col, fixture, live_data, scorer=None)
 
-            # ── Incidents (yellow / corner / offside) ──────────────────────
+            # Incidents
             incidents = live_data.get("incidents", [])
             if incidents:
                 process_incidents(fixture, incidents, home_score, away_score)
 
-            # ── Half time ─────────────────────────────────────────────────
-            # Sofascore: status_type="pause" or status_code=31
-            is_half_time = (status_type == "pause" or status_code == 31)
-            if is_half_time and not half_time_sent.get(match_id):
-                logger.info(f"⏸  Half time — {fixture['home_team']} vs {fixture['away_team']} {score_line}")
+            # Half time (Sofascore: status_type="pause" or status_code=31)
+            is_ht = (status_type == "pause" or status_code == 31)
+            if is_ht and not half_time_sent.get(match_id):
+                logger.info(f"⏸  Half time — {fixture['home_team']} vs {fixture['away_team']} {home_score}-{away_score}")
                 notify_half_time(fixture, home_score, away_score)
                 half_time_sent[match_id] = True
 
-            # Reset half-time flag when second half starts
-            if status_type == "inprogress" and half_time_sent.get(match_id) is True:
-                half_time_sent[match_id] = "done"  # won't reset again
-
-            # ── Full time ──────────────────────────────────────────────────
+            # Full time
             if new_status == "completed":
-                logger.info(f"🏁 Full time — {fixture['home_team']} vs {fixture['away_team']} {score_line}")
+                logger.info(f"🏁 Full time — {fixture['home_team']} vs {fixture['away_team']} {home_score}-{away_score}")
                 notify_full_time(fixture, home_score, away_score)
                 watch.pop(match_id)
                 continue
 
         if watch:
-            logger.info(f"⏳ {len(watch)} game(s) live — next check in {POLL_INTERVAL_SEC}s")
+            logger.info(f"⏳ {len(watch)} game(s) live — sleeping {POLL_INTERVAL_SEC}s")
             time.sleep(POLL_INTERVAL_SEC)
 
     logger.info("✅ All live games finished")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRE-KICKOFF COUNTDOWN LOOP
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_countdown_for_upcoming(col, upcoming_fixtures: list):
-    """
-    For fixtures kicking off within the next 65 mins,
-    send countdown notifications and wait for kick-off.
-    """
-    now = datetime.now(timezone.utc)
-    soon = [
-        f for f in upcoming_fixtures
-        if 0 < (f["_kickoff_utc"] - now).total_seconds() / 60 <= 65
-    ]
-
-    for fixture in soon:
-        send_countdown_notifications(fixture)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN INFINITE LOOP
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     logger.info("=" * 55)
     logger.info("⚽  FanClash Live Poller — Match Day Edition")
-    logger.info("📡  Running forever — smart sleep between games")
+    logger.info("🌐  Running as Render Web Service (free tier)")
     logger.info("=" * 55)
+
+    # Start health server first so Render sees an open port immediately
+    start_health_server()
 
     mongo_client, col = connect_db()
     session = make_session()
@@ -698,23 +661,22 @@ def main():
             try:
                 all_fixtures = get_upcoming_fixtures(col)
 
-                # 1. Send countdown notifications for upcoming games
+                # Send countdown notifications for games within 65 mins
                 run_countdown_for_upcoming(col, all_fixtures)
 
-                # 2. Poll live games
+                # Poll live games
                 live_now = get_live_fixtures(all_fixtures)
                 if live_now:
                     logger.info(f"🔴 {len(live_now)} game(s) live — starting poller")
                     poll_live_fixtures(col, session, live_now)
                 else:
-                    # Nothing live — smart sleep until next event
                     smart_sleep(col)
 
             except KeyboardInterrupt:
                 raise
             except Exception as e:
                 logger.error(f"❌ Loop error: {e}", exc_info=True)
-                time.sleep(60)  # brief pause before retrying
+                time.sleep(60)
 
     except KeyboardInterrupt:
         logger.info("\n⏹️  Stopped by user")
