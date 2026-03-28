@@ -1,17 +1,16 @@
 services:
-  - type: worker
+  - type: worker                    # ← MUST be worker, NOT web
     name: fanclash-live-poller
     runtime: python
-    region: frankfurt          # closest to EAT timezone — change if needed
-    plan: free                 # upgrade to starter ($7/mo) for always-on
-    rootDir: .                 # folder containing this render.yaml
+    region: frankfurt
+    plan: starter                   # free tier spins down — starter stays alive
+    rootDir: .
     buildCommand: pip install -r requirements.txt
-    startCommand: bash start.sh
+    startCommand: python live_poller.py
     envVars:
       - key: DATABASE_URL
-        sync: false            # set manually in Render dashboard (keeps credentials out of git)
+        sync: false                 # set in Render dashboard, keep out of git
       - key: FANCLASH_API
         value: https://fanclash-api.onrender.com/api
-      - key: PYTHON_UNBUFFERED
-        value: "1"             # makes logs appear instantly in Render dashboard
- 
+      - key: PYTHONUNBUFFERED
+        value: "1"                  # logs appear instantly
