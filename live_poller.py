@@ -1,16 +1,21 @@
 """
-FanClash Live Score Poller — Render Free Tier Edition (Fixed)
-==============================================================
-Runs as a Render Web Service (free tier) by opening a tiny
-health-check HTTP server on the required port. The actual
-poller logic runs on a background thread alongside it.
+FanClash Live Score Poller — Render Free Tier Edition (with Long-term Hype)
+===========================================================================
+Runs as a Render Web Service (free tier) with complete notification timeline:
 
-Notification timeline:
-  T-60  → "🔔 Kick-off in 1 hour"
-  T-45  → "⏰ 45 minutes to kick-off"
-  T-30  → "⚡ 30 mins to go"
-  T-10  → "🔥 Last chance to vote"
-  T+0   → "⚽ We are LIVE"
+Long-term hype (builds rivalry):
+  T-14 days  → "🎉 2 weeks until the big match!"
+  T-7 days   → "📅 1 week to go! Rivalry building"
+  T-1 day    → "⏰ 24 hours! Final predictions?"
+
+Match day countdown:
+  T-60 mins  → "🔔 Kick-off in 1 hour"
+  T-45 mins  → "⏰ 45 minutes to kick-off"
+  T-30 mins  → "⚡ 30 mins to go"
+  T-10 mins  → "🔥 Last chance to vote"
+  T+0        → "⚽ We are LIVE"
+
+Live match events:
   GOAL       → personalised (your team / rival / draw)
   YELLOW     → "🟨 Yellow card — {team}"
   CORNER     → "🚩 Corner to {team}"
@@ -138,7 +143,7 @@ def get_next_kickoff(fixtures: list) -> Optional[datetime]:
     return min(future) if future else None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMART SLEEP (FIXED - handles all time windows correctly)
+# SMART SLEEP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def smart_sleep(col):
@@ -301,7 +306,67 @@ def notify_all_voters(fixture: dict, title: str, body: str, ntype: str, extra: d
         logger.info(f"📲 [{ntype}] → {sent} voters | {fixture['home_team']} vs {fixture['away_team']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COUNTDOWN NOTIFICATIONS (FIXED - added T-45, improved ranges)
+# LONG-TERM HYPE NOTIFICATIONS (NEW!)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_long_term_notifications(fixture: dict):
+    """
+    Send hype notifications at:
+    - 14 days before (2 weeks)
+    - 7 days before (1 week)
+    - 1 day before (24 hours)
+    """
+    now = datetime.now(timezone.utc)
+    ko = fixture["_kickoff_utc"]
+    days_to = (ko - now).total_seconds() / 86400  # Convert to days
+    match_id = fixture["match_id"]
+    home = fixture["home_team"]
+    away = fixture["away_team"]
+    name = f"{home} vs {away}"
+    ko_eat = (ko + NAIROBI_OFFSET).strftime('%A, %B %d at %H:%M')
+    
+    # 2 weeks out (13-15 days)
+    if 13 <= days_to <= 15 and not _already_sent(match_id, "t14d"):
+        notify_all_voters(fixture,
+            title=f"🎉 2 weeks until {home} vs {away}!",
+            body=f"Mark your calendar for {ko_eat} EAT. Rivalry starts now! ⚔️",
+            ntype="hype_14_days",
+            extra={"days_to_kickoff": 14},
+        )
+        _mark_sent(match_id, "t14d")
+        logger.info(f"📅 2-week hype sent for {name}")
+    
+    # 1 week out (6-8 days)
+    elif 6 <= days_to <= 8 and not _already_sent(match_id, "t7d"):
+        notify_all_voters(fixture,
+            title=f"📅 1 week to go! {home} vs {away}",
+            body=f"Kickoff at {ko_eat} EAT. Who's taking this? 🔥",
+            ntype="hype_7_days",
+            extra={"days_to_kickoff": 7},
+        )
+        _mark_sent(match_id, "t7d")
+        logger.info(f"📅 1-week hype sent for {name}")
+    
+    # 1 day out (0.5-1.5 days)
+    elif 0.8 <= days_to <= 1.2 and not _already_sent(match_id, "t1d"):
+        notify_all_voters(fixture,
+            title=f"⏰ 24 hours until kick-off!",
+            body=f"{name} tomorrow at {ko_eat} EAT. Final predictions? 🎯",
+            ntype="hype_1_day",
+            extra={"days_to_kickoff": 1},
+        )
+        _mark_sent(match_id, "t1d")
+        logger.info(f"📅 1-day hype sent for {name}")
+
+
+def run_long_term_notifications(col):
+    """Check all upcoming fixtures and send long-term hype notifications."""
+    all_fixtures = get_upcoming_fixtures(col)
+    for fixture in all_fixtures:
+        send_long_term_notifications(fixture)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COUNTDOWN NOTIFICATIONS (match day)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _sent_alerts: dict = {}  # match_id → set of alert names already sent
@@ -335,7 +400,7 @@ def send_countdown_notifications(fixture: dict):
         )
         _mark_sent(match_id, "t60")
 
-    # T-45 (40-50 mins) - NEW!
+    # T-45 (40-50 mins)
     elif 40 <= mins_to <= 50 and not _already_sent(match_id, "t45"):
         notify_all_voters(fixture,
             title=f"⏰ 45 minutes to kick-off!",
@@ -387,7 +452,7 @@ def run_countdown_for_upcoming(col, upcoming_fixtures: list):
         send_countdown_notifications(fixture)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIVE EVENT NOTIFICATIONS
+# LIVE EVENT NOTIFICATIONS (goal, card, corner, offside, half time, full time)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def notify_goal(fixture: dict, scorer: str, new_home: int, new_away: int):
@@ -696,9 +761,11 @@ def poll_live_fixtures(col, session: cffi_requests.Session, live_fixtures: list)
 
 def main():
     logger.info("=" * 55)
-    logger.info("⚽  FanClash Live Poller — Match Day Edition (Fixed)")
+    logger.info("⚽  FanClash Live Poller — Complete Hype Edition")
     logger.info("🌐  Running as Render Web Service (free tier)")
-    logger.info("📢  Notifications: T-60, T-45, T-30, T-10, Kickoff, Goals, Cards, Corners, Offside, HT, FT")
+    logger.info("📢  Long-term hype: 2 weeks, 1 week, 1 day before")
+    logger.info("📢  Match day: T-60, T-45, T-30, T-10, Kickoff")
+    logger.info("📢  Live: Goals, Yellow cards, Corners, Offside, HT, FT")
     logger.info("=" * 55)
 
     # Start health server first so Render sees an open port immediately
@@ -711,6 +778,9 @@ def main():
         while True:
             try:
                 all_fixtures = get_upcoming_fixtures(col)
+
+                # Send long-term hype notifications (2 weeks, 1 week, 1 day)
+                run_long_term_notifications(col)
 
                 # Send countdown notifications for games within 65 mins
                 run_countdown_for_upcoming(col, all_fixtures)
