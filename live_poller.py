@@ -41,7 +41,7 @@ from pymongo import MongoClient
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATABASE_URL   = os.environ.get("DATABASE_URL",  "mongodb+srv://Capiyo:Capiyo%401010@cluster0.22lay5z.mongodb.net/clashdb?retryWrites=true&w=majority&appName=Cluster0")
+DATABASE_URL   = os.environ.get("DATABASE_URL",  "mongodb+srv://engineercapiyo_db_user:CapiyoClash1999@cluster0.omepeze.mongodb.net/clashdb?retryWrites=true&w=majority&appName=Cluster0")
 FANCLASH_API   = os.environ.get("FANCLASH_API",  "https://fanclash-api.onrender.com/api")
 SOFASCORE_API  = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME = "https://www.sofascore.com"
