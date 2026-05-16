@@ -77,29 +77,55 @@ def start_health_server():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def connect_db():
-    client = MongoClient(
-        DATABASE_URL,
-        serverSelectionTimeoutMS=30000,  # Increased for Render
-        connectTimeoutMS=30000,
-        socketTimeoutMS=45000,
-        retryWrites=True,
-        retryReads=True,
-    )
-    # Test connection with retry
-    for attempt in range(3):
-        try:
-            client.admin.command("ping")
-            logger.info("✅ MongoDB ping successful")
-            break
-        except Exception as e:
-            logger.warning(f"Ping attempt {attempt + 1} failed: {e}")
-            if attempt == 2:
-                raise
-            time.sleep(5)
+    logger.info("=" * 55)
+    logger.info("🔌 ATTEMPTING MONGODB CONNECTION")
+    logger.info("=" * 55)
+    logger.info(f"📡 DATABASE_URL: {DATABASE_URL[:100]}...")  # Show first 100 chars
     
-    games_col = client["clashdb"]["games"]
-    logger.info("✅ Connected to MongoDB (READ ONLY)")
-    return client, games_col
+    try:
+        logger.info("🔄 Creating MongoClient...")
+        client = MongoClient(
+            DATABASE_URL,
+            serverSelectionTimeoutMS=30000,
+            connectTimeoutMS=30000,
+            socketTimeoutMS=45000,
+            retryWrites=True,
+            retryReads=True,
+        )
+        logger.info("✅ MongoClient created")
+        
+        logger.info("🔄 Attempting ping...")
+        for attempt in range(3):
+            try:
+                client.admin.command("ping")
+                logger.info(f"✅ MongoDB ping successful (attempt {attempt + 1})")
+                break
+            except Exception as e:
+                logger.error(f"❌ Ping attempt {attempt + 1} failed: {type(e).__name__}: {e}")
+                if attempt == 2:
+                    raise
+                logger.info(f"⏳ Waiting 5 seconds before retry...")
+                time.sleep(5)
+        
+        logger.info("🔄 Getting games collection...")
+        games_col = client["clashdb"]["games"]
+        logger.info("✅ Got games collection")
+        
+        # Test a simple query
+        logger.info("🔄 Testing a simple query...")
+        count = games_col.count_documents({})
+        logger.info(f"✅ Collection has {count} documents")
+        
+        logger.info("✅ MongoDB connection successful!")
+        logger.info("=" * 55)
+        return client, games_col
+        
+    except Exception as e:
+        logger.error("=" * 55)
+        logger.error(f"❌ MONGODB CONNECTION FAILED: {type(e).__name__}")
+        logger.error(f"❌ Error details: {e}")
+        logger.error("=" * 55)
+        raise
 
 def get_kickoff_utc(fixture: dict) -> Optional[datetime]:
     try:
@@ -409,51 +435,49 @@ def smart_sleep(games_col):
 def main():
     logger.info("=" * 55)
     logger.info("⚽ FanClash Live Poller")
-    logger.info("📡 Reads fixtures from MongoDB (READ ONLY)")
-    logger.info("🔄 Polls Sofascore during live games")
-    logger.info("📤 Forwards events to Rust backend")
-    logger.info("💾 NO database writes (Rust handles that)")
     logger.info("=" * 55)
-
-    # Start health server for Render
+    
+    # Start health server
     start_health_server()
-    
-    # Connect to MongoDB (READ ONLY)
-    mongo_client, games_col = connect_db()
-    
-    # Create Sofascore session
-    session = make_session()
-    
-    # ========== SEND STARTUP TEST NOTIFICATION ==========
-    logger.info("")
-    logger.info("🔔 SENDING STARTUP TEST NOTIFICATION TO ALL USERS...")
-    send_startup_test_notification()
-    time.sleep(3)
-    # ====================================================
-    
-    logger.info("🔄 Starting main polling loop...")
+    logger.info("✅ Health server started")
     
     try:
+        # Connect to MongoDB
+        logger.info("🔄 Connecting to MongoDB...")
+        mongo_client, games_col = connect_db()
+        logger.info("✅ MongoDB connected")
+        
+        # Create session
+        logger.info("🔄 Creating Sofascore session...")
+        session = make_session()
+        logger.info("✅ Sofascore session created")
+        
+        # Send test notification
+        logger.info("🔔 Sending test notification...")
+        send_startup_test_notification()
+        
+        logger.info("🔄 Starting main loop...")
+        
         while True:
-            # Get all upcoming fixtures from MongoDB
             all_fixtures = get_upcoming_fixtures(games_col)
-            
-            # Check for live games
             live_fixtures = [f for f in all_fixtures if is_game_live(f)]
             
             if live_fixtures:
-                logger.info(f"🔴 {len(live_fixtures)} live game(s) found")
+                logger.info(f"🔴 {len(live_fixtures)} live games")
                 for fixture in live_fixtures:
                     poll_live_game(session, fixture)
             else:
-                # No live games, sleep until next game
                 smart_sleep(games_col)
                 
-    except KeyboardInterrupt:
-        logger.info("\n⏹️ Stopped by user")
+    except Exception as e:
+        logger.error(f"❌ FATAL ERROR: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(f"📚 Stack trace:\n{traceback.format_exc()}")
+        raise  # Re-raise to let Render know it crashed
     finally:
-        mongo_client.close()
-        logger.info("🔌 MongoDB connection closed")
+        if 'mongo_client' in locals():
+            mongo_client.close()
+            logger.info("🔌 MongoDB connection closed")
 
 if __name__ == "__main__":
     main()
