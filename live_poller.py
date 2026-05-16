@@ -116,6 +116,16 @@ def fetch_live_data(session: cffi_requests.Session, sofascore_id: int) -> Option
         if resp.status_code != 200:
             return None
         event = resp.json().get("event", {})
+        
+        # Get statistics if available
+        statistics = {}
+        try:
+            stats_resp = session.get(f"{SOFASCORE_API}/event/{sofascore_id}/statistics", timeout=10)
+            if stats_resp.status_code == 200:
+                statistics = stats_resp.json()
+        except:
+            pass
+        
         return {
             "home_score": (event.get("homeScore") or {}).get("current", 0),
             "away_score": (event.get("awayScore") or {}).get("current", 0),
@@ -123,6 +133,10 @@ def fetch_live_data(session: cffi_requests.Session, sofascore_id: int) -> Option
             "status_code": (event.get("status") or {}).get("code", 0),
             "time_elapsed": event.get("time", {}).get("elapsed", 0),
             "incidents": event.get("incidents", []),
+            "statistics": statistics,  # Add statistics
+            "possession": event.get("possession", {}),
+            "shots": event.get("shots", {}),
+            "passes": event.get("passes", {}),
         }
     except Exception as e:
         logger.warning(f"Error fetching event: {e}")
