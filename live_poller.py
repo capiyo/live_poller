@@ -30,7 +30,9 @@ from pymongo import MongoClient
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "mongodb+srv://engineercapiyo_db_user:CapiyoClash1999@cluster0.omepeze.mongodb.net/clashdb?retryWrites=true&w=majority&appName=Cluster0")
+# Use non-SRV connection string for Render compatibility
+DATABASE_URL = os.environ.get("DATABASE_URL", "mongodb://engineercapiyo_db_user:CapiyoClash1999@ac-hhcj2ej-shard-00-00.22lay5z.mongodb.net:27017,ac-hhcj2ej-shard-00-01.22lay5z.mongodb.net:27017,ac-hhcj2ej-shard-00-02.22lay5z.mongodb.net:27017/clashdb?ssl=true&replicaSet=atlas-11pm8i-shard-0&authSource=admin&retryWrites=true&w=majority&connectTimeoutMS=30000&socketTimeoutMS=30000")
+
 FANCLASH_API = os.environ.get("FANCLASH_API", "https://fanclash-api.onrender.com/api")
 SOFASCORE_API = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME = "https://www.sofascore.com"
@@ -77,11 +79,24 @@ def start_health_server():
 def connect_db():
     client = MongoClient(
         DATABASE_URL,
-        serverSelectionTimeoutMS=15000,
-        connectTimeoutMS=15000,
+        serverSelectionTimeoutMS=30000,  # Increased for Render
+        connectTimeoutMS=30000,
         socketTimeoutMS=45000,
+        retryWrites=True,
+        retryReads=True,
     )
-    client.admin.command("ping")
+    # Test connection with retry
+    for attempt in range(3):
+        try:
+            client.admin.command("ping")
+            logger.info("✅ MongoDB ping successful")
+            break
+        except Exception as e:
+            logger.warning(f"Ping attempt {attempt + 1} failed: {e}")
+            if attempt == 2:
+                raise
+            time.sleep(5)
+    
     games_col = client["clashdb"]["games"]
     logger.info("✅ Connected to MongoDB (READ ONLY)")
     return client, games_col
@@ -218,7 +233,7 @@ def send_startup_test_notification():
             logger.warning(f"⚠️ Rust returned {response.status_code}")
             return False
             
-    except std_requests.exceptions.Timeout:  # ← Change from requests to std_requests
+    except std_requests.exceptions.Timeout:
         logger.error("❌ Test notification timeout - Rust might be cold starting")
         return False
     except Exception as e:
