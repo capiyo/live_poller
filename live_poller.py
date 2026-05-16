@@ -34,7 +34,7 @@ FANCLASH_API = os.environ.get("FANCLASH_API", "https://fanclash-api.onrender.com
 SOFASCORE_API = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME = "https://www.sofascore.com"
 
-NAIROBI_OFFSET = timedelta(hours=3)
+NAIROBI_OFFSET = timedelta(hours=3)  # EAT is UTC+3
 POLL_INTERVAL_SEC = 10  # Poll every 10 seconds when game is live
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,13 +86,15 @@ def get_fixtures_from_rust() -> List[Dict[str, Any]]:
             # Convert Rust fixture format to expected dict format
             result = []
             for f in fixtures:
-                # Parse kickoff time
+                # Parse kickoff time - Database stores times in EAT (UTC+3)
                 date_iso = f.get("date_iso", "")
                 time_str = f.get("time", "00:00")
                 kickoff_utc = None
                 try:
-                    naive = datetime.strptime(f"{date_iso} {time_str}", "%Y-%m-%d %H:%M")
-                    kickoff_utc = (naive - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
+                    # Parse as EAT first (since database stores local time)
+                    naive_eat = datetime.strptime(f"{date_iso} {time_str}", "%Y-%m-%d %H:%M")
+                    # Convert to UTC by subtracting 3 hours
+                    kickoff_utc = (naive_eat - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
                 except Exception as e:
                     logger.warning(f"Could not parse kickoff for {f.get('match_id')}: {e}")
                 
@@ -132,11 +134,17 @@ def get_upcoming_fixtures_from_rust() -> List[Dict[str, Any]]:
 def get_next_kickoff_from_rust(fixtures: List[Dict[str, Any]]) -> Optional[datetime]:
     """Get next kickoff from fixtures list"""
     now = datetime.now(timezone.utc)
-    future = [f["_kickoff_utc"] for f in fixtures if f.get("_kickoff_utc") and f["_kickoff_utc"] > now]
+    future = []
+    
+    for f in fixtures:
+        ko_utc = f.get("_kickoff_utc")
+        if ko_utc and ko_utc > now:
+            future.append(ko_utc)
+    
     return min(future) if future else None
 
 def is_game_live_from_rust(fixture: Dict[str, Any]) -> bool:
-    """Check if game is live"""
+    """Check if game is live (within 5 minutes before to 120 minutes after kickoff)"""
     now = datetime.now(timezone.utc)
     ko = fixture.get("_kickoff_utc")
     if not ko:
@@ -334,11 +342,11 @@ def poll_live_game(session: cffi_requests.Session, fixture: dict):
             })
             last_away = away_score
         
-        # Forward score update
-        if (home_score, away_score) != (last_home, last_away):
+        # Forward score update if changed
+        if home_score != last_home or away_score != last_away:
             forward_to_rust(fixture, "score", live_data)
         
-        # Process incidents (yellow cards)
+        # Process incidents (yellow cards, red cards, etc.)
         for inc in live_data.get("incidents", []):
             inc_id = str(inc.get("id", ""))
             if inc_id in seen_incidents:
@@ -350,15 +358,23 @@ def poll_live_game(session: cffi_requests.Session, fixture: dict):
             is_home = inc.get("isHome", True)
             team = fixture["home_team"] if is_home else fixture["away_team"]
             minute = inc.get("time", {}).get("elapsed", time_elapsed)
+            player = inc.get("player", {}).get("name", "Unknown")
             
-            if inc_type == "card" and inc_cls == "yellow":
-                player = inc.get("player", {}).get("name", "Unknown")
-                logger.info(f"🟨 Yellow card - {team} ({player}) at {minute}'")
-                forward_to_rust(fixture, "yellow_card", {
-                    "time_elapsed": minute,
-                    "player": player,
-                    "team": team,
-                })
+            if inc_type == "card":
+                if inc_cls == "yellow":
+                    logger.info(f"🟨 Yellow card - {team} ({player}) at {minute}'")
+                    forward_to_rust(fixture, "yellow_card", {
+                        "time_elapsed": minute,
+                        "player": player,
+                        "team": team,
+                    })
+                elif inc_cls == "red":
+                    logger.info(f"🟥 Red card - {team} ({player}) at {minute}'")
+                    forward_to_rust(fixture, "red_card", {
+                        "time_elapsed": minute,
+                        "player": player,
+                        "team": team,
+                    })
         
         # Half time
         is_ht = (status_type == "pause" or status_code == 31)
@@ -379,28 +395,41 @@ def poll_live_game(session: cffi_requests.Session, fixture: dict):
     logger.info(f"✅ Finished polling {fixture['home_team']} vs {fixture['away_team']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMART SLEEP (using Rust API fixtures)
+# SMART SLEEP - Wake up 1 hour before game time
 # ─────────────────────────────────────────────────────────────────────────────
 
 def smart_sleep_from_rust(fixtures: List[Dict[str, Any]]):
-    """Sleep until 1 hour before the next game (using Rust API fixtures)"""
-    next_ko = get_next_kickoff_from_rust(fixtures)
-    if not next_ko:
+    """Sleep until 1 hour before the next game (using UTC times internally)"""
+    next_ko_utc = get_next_kickoff_from_rust(fixtures)
+    if not next_ko_utc:
         logger.info("📭 No future kick-offs — sleeping 6 hours")
         time.sleep(21600)
         return
 
-    now = datetime.now(timezone.utc)
-    mins_to = (next_ko - now).total_seconds() / 60
-    kickoff_eat = (next_ko + NAIROBI_OFFSET).strftime('%Y-%m-%d %H:%M')
+    now_utc = datetime.now(timezone.utc)
+    mins_to_game = (next_ko_utc - now_utc).total_seconds() / 60
+    
+    # Convert to EAT for display
+    next_ko_eat = next_ko_utc + NAIROBI_OFFSET
+    now_eat = now_utc + NAIROBI_OFFSET
+    
+    logger.info(f"🕐 Current time: {now_eat.strftime('%H:%M')} EAT / {now_utc.strftime('%H:%M')} UTC")
+    logger.info(f"⚽ Next game: {next_ko_eat.strftime('%H:%M')} EAT / {next_ko_utc.strftime('%H:%M')} UTC")
+    logger.info(f"⏱️ Minutes until kickoff: {mins_to_game:.0f}")
 
-    if mins_to > 60:
-        sleep_mins = mins_to - 60
-        logger.info(f"💤 Next game at {kickoff_eat} EAT — sleeping {sleep_mins:.0f} minutes")
+    # Wake up 1 hour before kickoff (60 minutes)
+    WAKE_UP_MINUTES_BEFORE = 60
+    
+    if mins_to_game > WAKE_UP_MINUTES_BEFORE:
+        sleep_mins = mins_to_game - WAKE_UP_MINUTES_BEFORE
+        wake_up_eat = (now_utc + timedelta(minutes=sleep_mins) + NAIROBI_OFFSET)
+        logger.info(f"💤 Sleeping {sleep_mins:.0f} minutes (will wake at {wake_up_eat.strftime('%H:%M')} EAT, 1 hour before kickoff)")
         time.sleep(sleep_mins * 60)
     else:
-        logger.info(f"⚽ Game at {kickoff_eat} EAT is starting soon — waking up")
-
+        # Game is within 1 hour - wait and check frequently for live status
+        wait_seconds = 30  # Check every 30 seconds
+        logger.info(f"⚽ Game starting in {mins_to_game:.0f} minutes - waiting {wait_seconds}s before checking for live status")
+        time.sleep(wait_seconds)
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,21 +446,20 @@ def main():
     # Start health server for Render
     start_health_server()
     
-    # Create Sofascore session (no MongoDB needed!)
+    # Create Sofascore session
     session = make_session()
     
-    # ========== SEND STARTUP TEST NOTIFICATION ==========
+    # Send startup test notification
     logger.info("")
     logger.info("🔔 SENDING STARTUP TEST NOTIFICATION TO ALL USERS...")
     send_startup_test_notification()
     time.sleep(3)
-    # ====================================================
     
     logger.info("🔄 Starting main polling loop...")
     
     try:
         while True:
-            # Get fixtures from Rust API (no MongoDB!)
+            # Get fixtures from Rust API
             all_fixtures = get_upcoming_fixtures_from_rust()
             
             if not all_fixtures:
@@ -447,7 +475,7 @@ def main():
                 for fixture in live_fixtures:
                     poll_live_game(session, fixture)
             else:
-                # No live games, sleep until next game
+                # No live games, sleep until 1 hour before next game
                 smart_sleep_from_rust(all_fixtures)
                 
     except KeyboardInterrupt:
