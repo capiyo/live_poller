@@ -1,7 +1,7 @@
 """
-FanClash Live Score Poller - Complete Edition
-===============================================
-1. Reads upcoming fixtures from MongoDB (READ ONLY)
+FanClash Live Score Poller - Complete Edition (No MongoDB)
+============================================================
+1. Fetches upcoming fixtures from Rust backend API
 2. Sleeps intelligently until game time
 3. Polls Sofascore during live games
 4. Forwards events to Rust backend (NO DB WRITES)
@@ -12,6 +12,7 @@ Rust backend handles:
 - Push notifications (via FCM)
 - WebSocket broadcasting
 - Startup test notification delivery
+- Fixture management
 """
 
 import time
@@ -20,18 +21,14 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from curl_cffi import requests as cffi_requests
 import requests as std_requests
-from pymongo import MongoClient
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Use non-SRV connection string for Render compatibility
-DATABASE_URL = os.environ.get("DATABASE_URL", "mongodb://engineercapiyo_db_user:CapiyoClash1999@ac-hhcj2ej-shard-00-00.22lay5z.mongodb.net:27017,ac-hhcj2ej-shard-00-01.22lay5z.mongodb.net:27017,ac-hhcj2ej-shard-00-02.22lay5z.mongodb.net:27017/clashdb?ssl=true&replicaSet=atlas-11pm8i-shard-0&authSource=admin&retryWrites=true&w=majority&connectTimeoutMS=30000&socketTimeoutMS=30000")
 
 FANCLASH_API = os.environ.get("FANCLASH_API", "https://fanclash-api.onrender.com/api")
 SOFASCORE_API = "https://api.sofascore.com/api/v1"
@@ -73,91 +70,73 @@ def start_health_server():
     logger.info(f"🌐 Health server listening on port {port}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MONGODB - READ ONLY (Poller only reads fixtures, NO WRITES!)
+# RUST BACKEND API - GET FIXTURES (NO MONGODB!)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def connect_db():
-    logger.info("=" * 55)
-    logger.info("🔌 ATTEMPTING MONGODB CONNECTION")
-    logger.info("=" * 55)
-    logger.info(f"📡 DATABASE_URL: {DATABASE_URL[:100]}...")  # Show first 100 chars
+def get_fixtures_from_rust() -> List[Dict[str, Any]]:
+    """Get upcoming fixtures from Rust backend instead of MongoDB"""
+    try:
+        logger.info("📡 Fetching fixtures from Rust backend...")
+        resp = std_requests.get(f"{FANCLASH_API}/games/upcoming", timeout=10)
+        
+        if resp.status_code == 200:
+            fixtures = resp.json()
+            logger.info(f"✅ Fetched {len(fixtures)} fixtures from Rust")
+            
+            # Convert Rust fixture format to expected dict format
+            result = []
+            for f in fixtures:
+                # Parse kickoff time
+                date_iso = f.get("date_iso", "")
+                time_str = f.get("time", "00:00")
+                kickoff_utc = None
+                try:
+                    naive = datetime.strptime(f"{date_iso} {time_str}", "%Y-%m-%d %H:%M")
+                    kickoff_utc = (naive - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
+                except Exception as e:
+                    logger.warning(f"Could not parse kickoff for {f.get('match_id')}: {e}")
+                
+                result.append({
+                    "match_id": f.get("match_id"),
+                    "sofascore_id": f.get("sofascore_id"),
+                    "home_team": f.get("home_team"),
+                    "away_team": f.get("away_team"),
+                    "home_score": f.get("home_score", 0),
+                    "away_score": f.get("away_score", 0),
+                    "status": f.get("status", "upcoming"),
+                    "date_iso": date_iso,
+                    "time": time_str,
+                    "_kickoff_utc": kickoff_utc,
+                    "lineups_fetched": False,
+                })
+            return result
+        else:
+            logger.warning(f"⚠️ Rust returned {resp.status_code}")
+            return []
+            
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch fixtures from Rust: {e}")
+        return []
+
+def get_upcoming_fixtures_from_rust() -> List[Dict[str, Any]]:
+    """Get upcoming fixtures from Rust (replaces MongoDB version)"""
+    fixtures = get_fixtures_from_rust()
     
-    try:
-        logger.info("🔄 Creating MongoClient...")
-        client = MongoClient(
-            DATABASE_URL,
-            serverSelectionTimeoutMS=30000,
-            connectTimeoutMS=30000,
-            socketTimeoutMS=45000,
-            retryWrites=True,
-            retryReads=True,
-        )
-        logger.info("✅ MongoClient created")
-        
-        logger.info("🔄 Attempting ping...")
-        for attempt in range(3):
-            try:
-                client.admin.command("ping")
-                logger.info(f"✅ MongoDB ping successful (attempt {attempt + 1})")
-                break
-            except Exception as e:
-                logger.error(f"❌ Ping attempt {attempt + 1} failed: {type(e).__name__}: {e}")
-                if attempt == 2:
-                    raise
-                logger.info(f"⏳ Waiting 5 seconds before retry...")
-                time.sleep(5)
-        
-        logger.info("🔄 Getting games collection...")
-        games_col = client["clashdb"]["games"]
-        logger.info("✅ Got games collection")
-        
-        # Test a simple query
-        logger.info("🔄 Testing a simple query...")
-        count = games_col.count_documents({})
-        logger.info(f"✅ Collection has {count} documents")
-        
-        logger.info("✅ MongoDB connection successful!")
-        logger.info("=" * 55)
-        return client, games_col
-        
-    except Exception as e:
-        logger.error("=" * 55)
-        logger.error(f"❌ MONGODB CONNECTION FAILED: {type(e).__name__}")
-        logger.error(f"❌ Error details: {e}")
-        logger.error("=" * 55)
-        raise
-
-def get_kickoff_utc(fixture: dict) -> Optional[datetime]:
-    try:
-        date_str = fixture.get("date_iso", "")
-        time_str = fixture.get("time", "00:00")
-        if not date_str:
-            return None
-        naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        return (naive - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
-    except Exception as e:
-        logger.warning(f"⚠️ Could not parse kick-off: {e}")
-        return None
-
-def get_upcoming_fixtures(games_col) -> list:
-    fixtures = list(games_col.find(
-        {"status": {"$in": ["upcoming", "live"]}},
-        sort=[("date_iso", 1), ("time", 1)],
-    ))
+    # Filter for upcoming and live games
     result = []
     for f in fixtures:
-        ko = get_kickoff_utc(f)
-        if ko:
-            f["_kickoff_utc"] = ko
+        if f.get("status") in ["upcoming", "live"]:
             result.append(f)
     return result
 
-def get_next_kickoff(fixtures: list) -> Optional[datetime]:
+def get_next_kickoff_from_rust(fixtures: List[Dict[str, Any]]) -> Optional[datetime]:
+    """Get next kickoff from fixtures list"""
     now = datetime.now(timezone.utc)
-    future = [f["_kickoff_utc"] for f in fixtures if f["_kickoff_utc"] > now]
+    future = [f["_kickoff_utc"] for f in fixtures if f.get("_kickoff_utc") and f["_kickoff_utc"] > now]
     return min(future) if future else None
 
-def is_game_live(fixture: dict) -> bool:
+def is_game_live_from_rust(fixture: Dict[str, Any]) -> bool:
+    """Check if game is live"""
     now = datetime.now(timezone.utc)
     ko = fixture.get("_kickoff_utc")
     if not ko:
@@ -400,18 +379,12 @@ def poll_live_game(session: cffi_requests.Session, fixture: dict):
     logger.info(f"✅ Finished polling {fixture['home_team']} vs {fixture['away_team']}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SMART SLEEP
+# SMART SLEEP (using Rust API fixtures)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def smart_sleep(games_col):
-    """Sleep until 1 hour before the next game"""
-    all_fixtures = get_upcoming_fixtures(games_col)
-    if not all_fixtures:
-        logger.info("📭 No upcoming fixtures — sleeping 6 hours")
-        time.sleep(21600)
-        return
-
-    next_ko = get_next_kickoff(all_fixtures)
+def smart_sleep_from_rust(fixtures: List[Dict[str, Any]]):
+    """Sleep until 1 hour before the next game (using Rust API fixtures)"""
+    next_ko = get_next_kickoff_from_rust(fixtures)
     if not next_ko:
         logger.info("📭 No future kick-offs — sleeping 6 hours")
         time.sleep(21600)
@@ -434,50 +407,57 @@ def smart_sleep(games_col):
 
 def main():
     logger.info("=" * 55)
-    logger.info("⚽ FanClash Live Poller")
+    logger.info("⚽ FanClash Live Poller (No MongoDB Version)")
+    logger.info("📡 Fetches fixtures from Rust backend API")
+    logger.info("🔄 Polls Sofascore during live games")
+    logger.info("📤 Forwards events to Rust backend")
+    logger.info("💾 NO database writes (Rust handles that)")
     logger.info("=" * 55)
-    
-    # Start health server
+
+    # Start health server for Render
     start_health_server()
-    logger.info("✅ Health server started")
+    
+    # Create Sofascore session (no MongoDB needed!)
+    session = make_session()
+    
+    # ========== SEND STARTUP TEST NOTIFICATION ==========
+    logger.info("")
+    logger.info("🔔 SENDING STARTUP TEST NOTIFICATION TO ALL USERS...")
+    send_startup_test_notification()
+    time.sleep(3)
+    # ====================================================
+    
+    logger.info("🔄 Starting main polling loop...")
     
     try:
-        # Connect to MongoDB
-        logger.info("🔄 Connecting to MongoDB...")
-        mongo_client, games_col = connect_db()
-        logger.info("✅ MongoDB connected")
-        
-        # Create session
-        logger.info("🔄 Creating Sofascore session...")
-        session = make_session()
-        logger.info("✅ Sofascore session created")
-        
-        # Send test notification
-        logger.info("🔔 Sending test notification...")
-        send_startup_test_notification()
-        
-        logger.info("🔄 Starting main loop...")
-        
         while True:
-            all_fixtures = get_upcoming_fixtures(games_col)
-            live_fixtures = [f for f in all_fixtures if is_game_live(f)]
+            # Get fixtures from Rust API (no MongoDB!)
+            all_fixtures = get_upcoming_fixtures_from_rust()
+            
+            if not all_fixtures:
+                logger.info("📭 No upcoming fixtures — sleeping 1 hour")
+                time.sleep(3600)
+                continue
+            
+            # Check for live games
+            live_fixtures = [f for f in all_fixtures if is_game_live_from_rust(f)]
             
             if live_fixtures:
-                logger.info(f"🔴 {len(live_fixtures)} live games")
+                logger.info(f"🔴 {len(live_fixtures)} live game(s) found")
                 for fixture in live_fixtures:
                     poll_live_game(session, fixture)
             else:
-                smart_sleep(games_col)
+                # No live games, sleep until next game
+                smart_sleep_from_rust(all_fixtures)
                 
+    except KeyboardInterrupt:
+        logger.info("\n⏹️ Stopped by user")
     except Exception as e:
-        logger.error(f"❌ FATAL ERROR: {type(e).__name__}: {e}")
+        logger.error(f"❌ Fatal error: {e}")
         import traceback
-        logger.error(f"📚 Stack trace:\n{traceback.format_exc()}")
-        raise  # Re-raise to let Render know it crashed
+        logger.error(traceback.format_exc())
     finally:
-        if 'mongo_client' in locals():
-            mongo_client.close()
-            logger.info("🔌 MongoDB connection closed")
+        logger.info("🔌 Poller shutdown complete")
 
 if __name__ == "__main__":
     main()
