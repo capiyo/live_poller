@@ -103,7 +103,7 @@ def update_fixture_status(match_id: str, status: str):
     try:
         response = std_requests.put(
             f"{FANCLASH_API}/games/{match_id}/status",
-            json={"status": status},
+            json={"match_id": match_id, "status": status},
             timeout=5,
             headers={"Content-Type": "application/json"}
         )
