@@ -45,16 +45,13 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"FanClash Poller OK")
 
+    def do_HEAD(self):  # ← add this
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+
     def log_message(self, *args):
         pass
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info(f"🌐 Health server listening on port {port}")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # RUST BACKEND API
 # ─────────────────────────────────────────────────────────────────────────────
