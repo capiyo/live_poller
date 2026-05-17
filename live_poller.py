@@ -233,26 +233,63 @@ def fetch_live_data(session: cffi_requests.Session, sofascore_id: int) -> Option
         
         incidents = event.get("incidents", [])
         
-        # Fetch statistics
-        statistics = {}
+        # Fetch and parse statistics correctly
+        statistics = {
+            "ball_possession": {"home": 0, "away": 0},
+            "total_shots": {"home": 0, "away": 0},
+            "shots_on_target": {"home": 0, "away": 0},
+            "corners": {"home": 0, "away": 0},
+            "fouls": {"home": 0, "away": 0},
+            "offsides": {"home": 0, "away": 0},
+            "yellow_cards": {"home": 0, "away": 0},
+            "red_cards": {"home": 0, "away": 0},
+            "pass_accuracy": {"home": 0, "away": 0},
+        }
+        
         try:
             stats_resp = session.get(f"{SOFASCORE_API}/event/{sofascore_id}/statistics", timeout=10)
             if stats_resp.status_code == 200:
                 stats_data = stats_resp.json()
-                # Parse statistics into flat structure
-                statistics = {
-                    "ball_possession": stats_data.get("ballPossession", {}),
-                    "total_shots": stats_data.get("totalShots", {}),
-                    "shots_on_target": stats_data.get("shotsOnTarget", {}),
-                    "corners": stats_data.get("corners", {}),
-                    "fouls": stats_data.get("fouls", {}),
-                    "offsides": stats_data.get("offsides", {}),
-                    "yellow_cards": stats_data.get("yellowCards", {}),
-                    "red_cards": stats_data.get("redCards", {}),
-                    "pass_accuracy": stats_data.get("passAccuracy", {}),
-                }
-        except:
-            pass
+                
+                # Parse the nested statistics structure
+                stats_list = stats_data.get("statistics", [])
+                for period_data in stats_list:
+                    groups = period_data.get("groups", [])
+                    for group in groups:
+                        items = group.get("statisticsItems", [])
+                        for item in items:
+                            name = item.get("name", "")
+                            home_value = item.get("homeValue", 0)
+                            away_value = item.get("awayValue", 0)
+                            
+                            # Convert to int (remove % if present)
+                            if isinstance(home_value, str):
+                                home_value = int(home_value.replace("%", ""))
+                            if isinstance(away_value, str):
+                                away_value = int(away_value.replace("%", ""))
+                            
+                            if "Ball possession" in name:
+                                statistics["ball_possession"] = {"home": home_value, "away": away_value}
+                            elif "Total shots" in name:
+                                statistics["total_shots"] = {"home": home_value, "away": away_value}
+                            elif "Shots on target" in name:
+                                statistics["shots_on_target"] = {"home": home_value, "away": away_value}
+                            elif "Corners" in name or "Corner kicks" in name:
+                                statistics["corners"] = {"home": home_value, "away": away_value}
+                            elif "Fouls" in name:
+                                statistics["fouls"] = {"home": home_value, "away": away_value}
+                            elif "Offsides" in name:
+                                statistics["offsides"] = {"home": home_value, "away": away_value}
+                            elif "Yellow cards" in name:
+                                statistics["yellow_cards"] = {"home": home_value, "away": away_value}
+                            elif "Red cards" in name:
+                                statistics["red_cards"] = {"home": home_value, "away": away_value}
+                            elif "Pass accuracy" in name:
+                                statistics["pass_accuracy"] = {"home": home_value, "away": away_value}
+                
+                logger.info(f"📊 PARSED STATISTICS: Ball possession: {statistics['ball_possession']['home']}% - {statistics['ball_possession']['away']}%")
+        except Exception as e:
+            logger.warning(f"Failed to fetch statistics: {e}")
         
         return {
             "home_score": (event.get("homeScore") or {}).get("current", 0),
@@ -267,95 +304,87 @@ def fetch_live_data(session: cffi_requests.Session, sofascore_id: int) -> Option
     except Exception as e:
         logger.warning(f"Error fetching event: {e}")
         return None
-
 def forward_event(fixture: dict, event_type: str, data: dict):
-    """Forward timeline event to Rust backend - POST /api/games/events"""
+    payload = {
+        "match_id": fixture["match_id"],
+        "event_type": event_type,
+        "minute": data.get("minute", 0),
+        "minute_display": data.get("minute_display", ""),
+        "home_score": data.get("home_score", 0),
+        "away_score": data.get("away_score", 0),
+        "player": data.get("player"),
+        "team": data.get("team"),
+        "player_out": data.get("player_out"),
+        "player_in": data.get("player_in"),
+        "shot_type": data.get("shot_type"),
+        "on_target": data.get("on_target"),
+        "blocked": data.get("blocked"),
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    
+    # DEBUG: Print the event payload
+    logger.info(f"📤 EVENT PAYLOAD ({event_type}): {json.dumps(payload, indent=2)}")
+    
     try:
-        payload = {
-            "fixture_id": fixture["match_id"],
-            "event_type": event_type,
-            "minute": data.get("minute", 0),
-            "minute_display": data.get("minute_display", ""),
-            "home_score": data.get("home_score", 0),
-            "away_score": data.get("away_score", 0),
-        }
-        
-        if event_type in ["goal", "yellow_card", "red_card", "foul", "offside"]:
-            payload["player"] = data.get("player")
-            payload["team"] = data.get("team")
-        elif event_type == "substitution":
-            payload["player_out"] = data.get("player_out")
-            payload["player_in"] = data.get("player_in")
-            payload["team"] = data.get("team")
-        elif event_type == "shot":
-            payload["player"] = data.get("player")
-            payload["team"] = data.get("team")
-            payload["shot_type"] = data.get("shot_type")
-            payload["on_target"] = data.get("on_target")
-            payload["blocked"] = data.get("blocked")
-        elif event_type in ["free_kick", "corner"]:
-            payload["team"] = data.get("team")
-        
         response = std_requests.post(
             f"{FANCLASH_API}/games/events",
             json=payload,
-            timeout=5
+            timeout=5,
+            headers={"Content-Type": "application/json"}
         )
         
-        if response.status_code != 200:
-            logger.warning(f"Failed to forward {event_type}: {response.status_code}")
+        if response.status_code == 200:
+            logger.info(f"✅ Forwarded {event_type} successfully - Response: {response.text[:100]}")
+        else:
+            logger.warning(f"❌ Failed to forward {event_type}: {response.status_code} - {response.text[:200]}")
+            
     except Exception as e:
-        logger.error(f"Failed to forward {event_type}: {e}")
-
-def forward_statistics(fixture: dict, minute: int, minute_display: str, stats: dict, home_score: int, away_score: int):
-    """Forward statistics snapshot to Rust backend - POST /api/games/statistics"""
+        logger.error(f"❌ Exception forwarding {event_type}: {e}")
+def forward_statistics(fixture: dict, minute: int, minute_display: str, stats_data: dict, home_score: int, away_score: int):
     try:
-        # Get values with defaults
-        def get_value(side):
-            return {
-                "home": stats.get(side, {}).get("home", 0),
-                "away": stats.get(side, {}).get("away", 0)
-            }
-        
         payload = {
-            "fixture_id": fixture["match_id"],
+            "match_id": fixture["match_id"],
             "minute": minute,
             "minute_display": minute_display,
             "home_score": home_score,
             "away_score": away_score,
-            "ball_possession_home": stats.get("ball_possession", {}).get("home", 0),
-            "ball_possession_away": stats.get("ball_possession", {}).get("away", 0),
-            "total_shots_home": stats.get("total_shots", {}).get("home", 0),
-            "total_shots_away": stats.get("total_shots", {}).get("away", 0),
-            "shots_on_target_home": stats.get("shots_on_target", {}).get("home", 0),
-            "shots_on_target_away": stats.get("shots_on_target", {}).get("away", 0),
-            "corners_home": stats.get("corners", {}).get("home", 0),
-            "corners_away": stats.get("corners", {}).get("away", 0),
-            "fouls_home": stats.get("fouls", {}).get("home", 0),
-            "fouls_away": stats.get("fouls", {}).get("away", 0),
-            "offsides_home": stats.get("offsides", {}).get("home", 0),
-            "offsides_away": stats.get("offsides", {}).get("away", 0),
-            "yellow_cards_home": stats.get("yellow_cards", {}).get("home", 0),
-            "yellow_cards_away": stats.get("yellow_cards", {}).get("away", 0),
-            "red_cards_home": stats.get("red_cards", {}).get("home", 0),
-            "red_cards_away": stats.get("red_cards", {}).get("away", 0),
-            "pass_accuracy_home": stats.get("pass_accuracy", {}).get("home", 0),
-            "pass_accuracy_away": stats.get("pass_accuracy", {}).get("away", 0),
+            "ball_possession_home": stats_data.get("ball_possession", {}).get("home", 0),
+            "ball_possession_away": stats_data.get("ball_possession", {}).get("away", 0),
+            "total_shots_home": stats_data.get("total_shots", {}).get("home", 0),
+            "total_shots_away": stats_data.get("total_shots", {}).get("away", 0),
+            "shots_on_target_home": stats_data.get("shots_on_target", {}).get("home", 0),
+            "shots_on_target_away": stats_data.get("shots_on_target", {}).get("away", 0),
+            "corners_home": stats_data.get("corners", {}).get("home", 0),
+            "corners_away": stats_data.get("corners", {}).get("away", 0),
+            "fouls_home": stats_data.get("fouls", {}).get("home", 0),
+            "fouls_away": stats_data.get("fouls", {}).get("away", 0),
+            "offsides_home": stats_data.get("offsides", {}).get("home", 0),
+            "offsides_away": stats_data.get("offsides", {}).get("away", 0),
+            "yellow_cards_home": stats_data.get("yellow_cards", {}).get("home", 0),
+            "yellow_cards_away": stats_data.get("yellow_cards", {}).get("away", 0),
+            "red_cards_home": stats_data.get("red_cards", {}).get("home", 0),
+            "red_cards_away": stats_data.get("red_cards", {}).get("away", 0),
+            "pass_accuracy_home": stats_data.get("pass_accuracy", {}).get("home", 0),
+            "pass_accuracy_away": stats_data.get("pass_accuracy", {}).get("away", 0),
         }
+        
+        # DEBUG: Print the payload
+        logger.info(f"📊 STATS PAYLOAD: {json.dumps(payload)}")
         
         response = std_requests.post(
             f"{FANCLASH_API}/games/statistics",
             json=payload,
-            timeout=5
+            timeout=5,
+            headers={"Content-Type": "application/json"}
         )
         
         if response.status_code == 200:
-            logger.info(f"📊 Statistics forwarded at {minute_display}'")
+            logger.info(f"📊 Statistics forwarded at {minute_display}")
         else:
-            logger.warning(f"Failed to forward statistics: {response.status_code}")
+            logger.warning(f"Failed to forward statistics: {response.status_code} - {response.text[:200]}")
+            
     except Exception as e:
         logger.error(f"Failed to forward statistics: {e}")
-
 def _get_player_name(inc: dict) -> str:
     if "player" in inc:
         player_obj = inc["player"]
@@ -496,10 +525,9 @@ def poll_live_game(session: cffi_requests.Session, fixture: dict):
                     "player": player, "team": team
                 })
         
-        # FORWARD STATISTICS (every 60 seconds)
-        if statistics and time_elapsed - last_stats_minute >= STATS_INTERVAL_SEC:
-            forward_statistics(fixture, time_elapsed, minute_display, statistics, home_score, away_score)
-            last_stats_minute = time_elapsed
+        if statistics and time_elapsed > 0 and time_elapsed - last_stats_minute >= STATS_INTERVAL_SEC:
+           forward_statistics(fixture, time_elapsed, minute_display, statistics, home_score, away_score)
+           last_stats_minute = time_elapsed
         
         # HALF TIME
         if status_type == "pause" and not half_time_sent:
