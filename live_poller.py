@@ -101,7 +101,7 @@ def get_fixtures_from_rust() -> List[Dict[str, Any]]:
 
 def update_fixture_status(match_id: str, status: str):
     try:
-        response = std_requests.patch(
+        response = std_requests.put(
             f"{FANCLASH_API}/games/{match_id}/status",
             json={"status": status},
             timeout=5,
